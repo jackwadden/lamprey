@@ -1,4 +1,4 @@
-#!/usr/bin/python
+#!/usr/bin/pyAthon
 
 import sys
 
@@ -6,6 +6,11 @@ import sys
 import swalign
 from Bio import SeqIO
 from Bio.SeqRecord import SeqRecord
+
+#########################
+fwd_primer_order = ['F3', 'F2', 'FLPc', 'F1', 'B1c', 'BLP', 'T', 'B2c', 'B3c']
+rev_primer_order = ['B3', 'B2', 'Tc', 'BLPc', 'B1', 'F1c', 'FLP', 'F2c', 'F3c']
+
 
 #########################
 class PrimerSet:
@@ -321,7 +326,113 @@ def printPrimerAlignments(seq, alignments):
             
             
     sys.stdout.write('\n')
+
+###################
+def extractAmpliconAroundTarget(alignments, target):
+
+    amplicon_start = 0
+    amplicon_end = 0
+    
+    # is target forward or reverse?
+    fwd_strand = True if target.name == "T" else False
+
+    print("Forward strand?: ",fwd_strand)
+
+    # find target alignment index
+    target_index = alignments.index(target)
+    print("Target index: ", target_index)
+
+    #####
+    # look to the right
+    #####
+    allowed_mismatches = 1
+    #print("LOOKING RIGHT")
+    primer_counter = fwd_primer_order.index('T') if fwd_strand else rev_primer_order.index('Tc')
+    primer_counter = primer_counter + 1
+
+    all_matched = True
+    for i in range(target_index + 1, len(alignments)):
+
+        # primer name
+        primer_name = alignments[i].name
+
+        # expected primer name
+        if fwd_strand:
+            expected_primer_name = fwd_primer_order[primer_counter]
+        else:
+            expected_primer_name = rev_primer_order[primer_counter]
+
+        #print("primer name: ", primer_name)
+        #print("expected primer name: ", expected_primer_name)
+
+        # on a mismatch, end the search
+        if primer_name != expected_primer_name:
+
+            if allowed_mismatches > 0:
+                allowed_mismatches = allowed_mismatches - 1
+            else:
+                # we've found our end, point, so make our end the last match end
+                amplicon_end = alignments[i-1].end
+                #print("MISMATCH!")
+                all_matched = False
+                break
+        else:
+            #print("MATCH")
+            primer_counter = primer_counter + 1
+
+
+    if all_matched:
+        amplicon_end = alignments[-1].end
+
+    print("Trim end: ", amplicon_end)
         
+    #####
+    # look to the left
+    #####
+    allowed_mismatches = 1
+    #print("LOOKING LEFT")
+    primer_counter = fwd_primer_order.index('T') if fwd_strand else rev_primer_order.index('Tc')
+    primer_counter = primer_counter - 1
+
+    all_matched = True
+    for i in range(target_index - 1, 0, -1):
+
+        print(i)
+        
+        # primer name
+        primer_name = alignments[i].name
+
+        # expected primer name
+        if fwd_strand:
+            expected_primer_name = fwd_primer_order[primer_counter]
+        else:
+            expected_primer_name = rev_primer_order[primer_counter]
+
+        #print("primer name: ", primer_name)
+        #print("expected primer name: ", expected_primer_name)
+
+        # on a mismatch, end the search
+        if primer_name != expected_primer_name:
+            if allowed_mismatches > 0:
+                allowed_mismatches = allowed_mismatches - 1
+                
+            else:
+                # we've found our end, point, so make our end the last match end
+                amplicon_start = alignments[i+1].start
+                all_matched = False
+                #print("MISMATCH!")
+                break
+        else:
+            #print("MATCH")
+            primer_counter = primer_counter - 1
+
+    if all_matched:
+        amplicon_start = 0
+
+    print("Trim start: ", amplicon_start)
+        
+    return amplicon_start, amplicon_end
+    
 ################################################
 
 # parse args
@@ -371,17 +482,20 @@ for lampli in lamplicons:
 
     target_counter = 0
     targets = []
-    buf = 15
+    buf = 60
+
     # gather targets into separate SeqIO Records
     for alignment in alignments:
         if alignment.name == 'T' or alignment.name == 'Tc':
             target_counter = target_counter + 1
 
             
-            # separate out
+            # reach left and right to find concatemer cut points
             seq_start = alignment.start - buf if (alignment.start - buf) > 0 else 0
             seq_end = alignment.end + buf if (alignment.end + buf) < len(lamplicon) else len(lamplicon) - 1
 
+            seq_start, seq_end = extractAmpliconAroundTarget(alignments, alignment)
+            
             record = SeqRecord(
                 lamplicon[seq_start:seq_end],
                 "{}_{}".format(lamplicon_counter, target_counter),
@@ -394,8 +508,9 @@ for lampli in lamplicons:
     print("NUM TARGETS: {}".format(target_counter))
 
     # write targets to new fasta file
-    fn = "{}_{}.fasta".format(lamplicon_counter, target_counter)
+    fn = "alignments/{}_{}.fasta".format(lamplicon_counter, target_counter)
     with open(fn, "w") as output_handle:
         SeqIO.write(targets, output_handle, "fasta")
     
     lamplicon_counter = lamplicon_counter + 1
+
