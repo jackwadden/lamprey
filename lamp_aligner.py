@@ -1,10 +1,11 @@
 #!/usr/bin/python
 
 import sys
-import cProfile
+
 
 import swalign
 from Bio import SeqIO
+from Bio.SeqRecord import SeqRecord
 
 #########################
 class PrimerSet:
@@ -20,7 +21,8 @@ class PrimerSet:
         self.F2 = F2
         self.B1 = B1
         self.B2 = B2
-
+        
+        
 #########################
 class Alignment:
 
@@ -270,7 +272,7 @@ def printPrimerAlignments(seq, alignments):
 
             
             # print corresponding alignment
-            for aln_pos in range(wrap_counter * wrap, pos):
+            for aln_pos in range(wrap_counter * wrap, pos+1):
 
                 found_start = False
                 found_end = False
@@ -359,10 +361,6 @@ for lampli in lamplicons:
     if lamplicon_counter > lamplicon_target:
         break
     
-    #print("target: {}".format(lamplicon_target))
-    
-    lamplicon_counter = lamplicon_counter + 1
-    
     lamplicon = lampli.seq
 
     alignments = findAllPrimerAlignments(sw, lamplicon, primers, alignment_identity_threshold)
@@ -372,16 +370,32 @@ for lampli in lamplicons:
     printPrimerAlignments(lamplicon, alignments)
 
     target_counter = 0
+    targets = []
+    buf = 15
+    # gather targets into separate SeqIO Records
     for alignment in alignments:
         if alignment.name == 'T' or alignment.name == 'Tc':
             target_counter = target_counter + 1
 
+            
+            # separate out
+            seq_start = alignment.start - buf if (alignment.start - buf) > 0 else 0
+            seq_end = alignment.end + buf if (alignment.end + buf) < len(lamplicon) else len(lamplicon) - 1
+
+            record = SeqRecord(
+                lamplicon[seq_start:seq_end],
+                "{}_{}".format(lamplicon_counter, target_counter),
+                "{}_{}".format(lamplicon_counter, target_counter),
+                "Lamplicon {} target {}".format(lamplicon_counter, target_counter)
+            )
+            #print(record)
+            targets.append(record)
+            
     print("NUM TARGETS: {}".format(target_counter))
+
+    # write targets to new fasta file
+    fn = "{}_{}.fasta".format(lamplicon_counter, target_counter)
+    with open(fn, "w") as output_handle:
+        SeqIO.write(targets, output_handle, "fasta")
     
-
-
-    
-    
-
-
-
+    lamplicon_counter = lamplicon_counter + 1
