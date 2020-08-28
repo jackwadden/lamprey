@@ -437,16 +437,26 @@ def extractAmpliconAroundTarget(alignments, target):
 
 # parse args
 args = sys.argv
-lamplicon_target = int(args[1])
+
+# print usage
+if len(sys.argv) != 4:
+    print("usage: python3 lamp_aligner.py <primer_set> <lamplicons.fq> <lamplicon_target>")
+    sys.exit(1)
+
+
+primer_set_fn = args[1]
+lamplicon_fn = args[2]
+lamplicon_target = int(args[3])
+
 
 # parse reads
 #print("Parsing fastq file...")
-lamplicons = SeqIO.parse("data/lamp_H33H31mux/UMPED18B_H33.fastq", "fastq")
+lamplicons = SeqIO.parse(lamplicon_fn, "fastq")
 #print("    Done.")
 
 # parse lamp primers
 #print("Parsing lamp primers...")
-primers = getPrimersFromFile("data/primers/H3.3_set1.primers")
+primers = getPrimersFromFile(primer_set_fn)
 #print("    Done.")
 
 # prep aligner
