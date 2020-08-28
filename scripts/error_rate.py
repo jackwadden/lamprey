@@ -1,6 +1,6 @@
 #!/usr/bin/python
 
-import sys,re
+import sys
 
 import pysam
 
