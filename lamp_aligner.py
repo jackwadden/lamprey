@@ -15,7 +15,7 @@ rev_primer_order = ['B3', 'B2', 'Tc', 'BLPc', 'B1', 'F1c', 'FLP', 'F2c', 'F3c']
 #########################
 class PrimerSet:
     
-    def __init__(self, F3='', B3='', FIP='', BIP='', FLP='', BLP='', F1='', F2='', B1='', B2=''):
+    def __init__(self, F3='', B3='', FIP='', BIP='', FLP='', BLP='', F1='', F2='', B1='', B2='',T=''):
         self.F3 = F3
         self.B3 = B3
         self.FIP = FIP
@@ -26,7 +26,7 @@ class PrimerSet:
         self.F2 = F2
         self.B1 = B1
         self.B2 = B2
-        
+        self.T = T
         
 #########################
 class Alignment:
@@ -501,8 +501,8 @@ for lampli in lamplicons:
 
             
             # reach left and right to find concatemer cut points
-            seq_start = alignment.start - buf if (alignment.start - buf) > 0 else 0
-            seq_end = alignment.end + buf if (alignment.end + buf) < len(lamplicon) else len(lamplicon) - 1
+            #seq_start = alignment.start - buf if (alignment.start - buf) > 0 else 0
+            #seq_end = alignment.end + buf if (alignment.end + buf) < len(lamplicon) else len(lamplicon) - 1
 
             seq_start, seq_end = extractAmpliconAroundTarget(alignments, alignment)
             
