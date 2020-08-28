@@ -336,11 +336,11 @@ def extractAmpliconAroundTarget(alignments, target):
     # is target forward or reverse?
     fwd_strand = True if target.name == "T" else False
 
-    print("Forward strand?: ",fwd_strand)
+    #print("Forward strand?: ",fwd_strand)
 
     # find target alignment index
     target_index = alignments.index(target)
-    print("Target index: ", target_index)
+    #print("Target index: ", target_index)
 
     #####
     # look to the right
@@ -384,7 +384,7 @@ def extractAmpliconAroundTarget(alignments, target):
     if all_matched:
         amplicon_end = alignments[-1].end
 
-    print("Trim end: ", amplicon_end)
+    #print("Trim end: ", amplicon_end)
         
     #####
     # look to the left
@@ -397,7 +397,7 @@ def extractAmpliconAroundTarget(alignments, target):
     all_matched = True
     for i in range(target_index - 1, 0, -1):
 
-        print(i)
+        #print(i)
         
         # primer name
         primer_name = alignments[i].name
@@ -429,7 +429,7 @@ def extractAmpliconAroundTarget(alignments, target):
     if all_matched:
         amplicon_start = 0
 
-    print("Trim start: ", amplicon_start)
+    #print("Trim start: ", amplicon_start)
         
     return amplicon_start, amplicon_end
     
@@ -501,11 +501,17 @@ for lampli in lamplicons:
 
             
             # reach left and right to find concatemer cut points
+
+            # Naive implementation where we just consider target + buf and target - buf region
+            # didn't work nearly as well in practice as extending the chain to encompass as much of a full
+            # amplicon as possible
             #seq_start = alignment.start - buf if (alignment.start - buf) > 0 else 0
             #seq_end = alignment.end + buf if (alignment.end + buf) < len(lamplicon) else len(lamplicon) - 1
 
+            # primer token chain extension
             seq_start, seq_end = extractAmpliconAroundTarget(alignments, alignment)
-            
+
+            # generate new read from lamplicon substring
             record = SeqRecord(
                 lamplicon[seq_start:seq_end],
                 "{}_{}".format(lamplicon_counter, target_counter),
@@ -515,12 +521,14 @@ for lampli in lamplicons:
             #print(record)
             targets.append(record)
             
-    print("NUM TARGETS: {}".format(target_counter))
+    print("Found Targets: {}".format(target_counter))
 
     # write targets to new fasta file
+    print("Writing {} target sequences to {}_{}.fasta".format(target_counter, lamplicon_counter, target_counter)
     fn = "alignments/{}_{}.fasta".format(lamplicon_counter, target_counter)
     with open(fn, "w") as output_handle:
         SeqIO.write(targets, output_handle, "fasta")
-    
+
+    # consider next lamplicon candidate
     lamplicon_counter = lamplicon_counter + 1
 
