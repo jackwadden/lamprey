@@ -556,10 +556,31 @@ for lampli in lamplicons:
     out_cns_sam = "{}_{}_cns.sam".format(lamplicon_counter, target_counter)
 
     # remove leading/trailing ambiguous characters
+    for consensus_seq in SeqIO.parse(fastq_cns_fn, "fastq"):
+
+        # find location of last n from the start
+        n_end = 0
+        while consensus_seq.seq[n_end] == 'n' or consensus_seq.seq[n_end] == 'N':
+            n_end = n_end + 1
+
+        n_start = len(consensus_seq.seq) - 1
+        while consensus_seq.seq[n_start] == 'n' or consensus_seq.seq[n_start] == 'N':
+            n_start = n_start - 1
+
+        consensus_seq = consensus_seq[n_end:n_start+1]
+
+    # re-write consensus fastq
+    with open(fastq_cns_fn, "w") as output_handle:
+        SeqIO.write(consensus_seq, output_handle, "fastq")
+    
     
     # align consensus sequence
     subprocess.run(["minimap2","-a","-xmap-ont","--eqx","-t 1","-w 1", "-o{}".format(out_cns_sam),ref_fn,fastq_cns_fn], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
+    # convert sam to bam
+    subprocess.run([sam_to_bam, out_cns_sam], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    
     print("  DONE")
     
     # consider next lamplicon candidate
