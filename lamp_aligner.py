@@ -1,9 +1,12 @@
 #!/usr/bin/pyAthon
 
 import sys
-
+import os
+import subprocess
 
 import swalign
+import mappy
+
 from Bio import SeqIO
 from Bio.SeqRecord import SeqRecord
 
@@ -99,8 +102,6 @@ def getPrimersFromFile(fn):
 #######
 def alignPrimer(aligner, seq, primer, primer_name):
 
-    #
-    
     # 
     alignment_tmp = aligner.align(seq, primer)
     alignment = Alignment(alignment_tmp.r_pos,
@@ -435,18 +436,25 @@ def extractAmpliconAroundTarget(alignments, target):
     
 ################################################
 
+# get file directory for relative script paths
+dirname = os.path.dirname(__file__)
+generate_consensus = os.path.join(dirname, 'scripts/generate_consensus.sh')
+sam_to_bam = os.path.join(dirname, 'scripts/sam_to_bam.sh')
+
+
 # parse args
 args = sys.argv
 
 # print usage
-if len(sys.argv) != 4:
-    print("usage: python3 lamp_aligner.py <primer_set> <lamplicons.fq> <lamplicon_target>")
+if len(sys.argv) != 5:
+    print("usage: python3 lamp_aligner.py <target_ref.fa> <primer_set> <lamplicons.fq> <lamplicon_target>")
     sys.exit(1)
 
 
-primer_set_fn = args[1]
-lamplicon_fn = args[2]
-lamplicon_target = int(args[3])
+target_ref_fn = args[1]
+primer_set_fn = args[2]
+lamplicon_fn = args[3]
+lamplicon_target = int(args[4])
 
 
 # parse reads
@@ -524,11 +532,36 @@ for lampli in lamplicons:
     print("Found Targets: {}".format(target_counter))
 
     # write targets to new fasta file
-    print("Writing {} target sequences to {}_{}.fasta".format(target_counter, lamplicon_counter, target_counter)
-    fn = "alignments/{}_{}.fasta".format(lamplicon_counter, target_counter)
-    with open(fn, "w") as output_handle:
+    print("Writing {} target sequences to {}_{}.fasta".format(target_counter, lamplicon_counter, target_counter))
+    fasta_fn = "{}_{}.fasta".format(lamplicon_counter, target_counter)
+    with open(fasta_fn, "w") as output_handle:
         SeqIO.write(targets, output_handle, "fasta")
 
+
+    print("Generating consensus sequence and alignment...")
+    # align targets to ref
+    ref_fn = target_ref_fn
+
+    out_sam = "{}_{}.sam".format(lamplicon_counter,target_counter)
+    in_bam = "{}_{}.bam".format(lamplicon_counter,target_counter)
+    
+    subprocess.run(["minimap2","-a","-xmap-ont","--eqx","-t 1","-w 1", "-o{}".format(out_sam),ref_fn,fasta_fn], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    # convert sam to bam
+    subprocess.run([sam_to_bam, out_sam], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    # generate consensus sequence
+    subprocess.run([generate_consensus, ref_fn, in_bam], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    fastq_cns_fn = "{}_{}_cns.fastq".format(lamplicon_counter, target_counter)
+    out_cns_sam = "{}_{}_cns.sam".format(lamplicon_counter, target_counter)
+
+    # remove leading/trailing ambiguous characters
+    
+    # align consensus sequence
+    subprocess.run(["minimap2","-a","-xmap-ont","--eqx","-t 1","-w 1", "-o{}".format(out_cns_sam),ref_fn,fastq_cns_fn], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    print("  DONE")
+    
     # consider next lamplicon candidate
     lamplicon_counter = lamplicon_counter + 1
 
