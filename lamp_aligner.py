@@ -6,13 +6,16 @@ import subprocess
 
 import swalign
 import mappy
+import pysam
 
 from Bio import SeqIO
 from Bio.SeqRecord import SeqRecord
 
 #########################
-fwd_primer_order = ['F3', 'F2', 'FLPc', 'F1', 'B1c', 'BLP', 'T', 'B2c', 'B3c']
-rev_primer_order = ['B3', 'B2', 'Tc', 'BLPc', 'B1', 'F1c', 'FLP', 'F2c', 'F3c']
+#fwd_primer_order = ['F3', 'F2', 'FLPc', 'F1', 'B1c', 'BLP', 'T', 'B2c', 'B3c']
+#rev_primer_order = ['B3', 'B2', 'Tc', 'BLPc', 'B1', 'F1c', 'FLP', 'F2c', 'F3c']
+fwd_primer_order = ['F3', 'F2', 'F1', 'B1c', 'T', 'B2c', 'B3c']
+rev_primer_order = ['B3', 'B2', 'Tc', 'B1', 'F1c', 'F2c', 'F3c']
 
 
 #########################
@@ -244,10 +247,10 @@ def findAllPrimerAlignments(aligner, seq, primers, identity_threshold):
     alignment_list.extend(findPrimerAlignments(sw, lamplicon, rc(primers.B2), "B2c", identity_threshold))
     alignment_list.extend(findPrimerAlignments(sw, lamplicon, primers.B3, "B3", identity_threshold))
     alignment_list.extend(findPrimerAlignments(sw, lamplicon, rc(primers.B3), "B3c", identity_threshold))
-    alignment_list.extend(findPrimerAlignments(sw, lamplicon, primers.BLP, "BLP", identity_threshold))
-    alignment_list.extend(findPrimerAlignments(sw, lamplicon, rc(primers.BLP), "BLPc", identity_threshold))
-    alignment_list.extend(findPrimerAlignments(sw, lamplicon, primers.FLP, "FLP", identity_threshold))
-    alignment_list.extend(findPrimerAlignments(sw, lamplicon, rc(primers.FLP), "FLPc", identity_threshold))
+    #alignment_list.extend(findPrimerAlignments(sw, lamplicon, primers.BLP, "BLP", identity_threshold))
+    #alignment_list.extend(findPrimerAlignments(sw, lamplicon, rc(primers.BLP), "BLPc", identity_threshold))
+    #alignment_list.extend(findPrimerAlignments(sw, lamplicon, primers.FLP, "FLP", identity_threshold))
+    #alignment_list.extend(findPrimerAlignments(sw, lamplicon, rc(primers.FLP), "FLPc", identity_threshold))
     alignment_list.extend(findPrimerAlignments(sw, lamplicon, primers.T, "T", identity_threshold))
     alignment_list.extend(findPrimerAlignments(sw, lamplicon, rc(primers.T), "Tc", identity_threshold))
 
@@ -346,11 +349,13 @@ def extractAmpliconAroundTarget(alignments, target):
     #####
     # look to the right
     #####
-    allowed_mismatches = 1
+    allowed_mismatches = 0
     #print("LOOKING RIGHT")
     primer_counter = fwd_primer_order.index('T') if fwd_strand else rev_primer_order.index('Tc')
     primer_counter = primer_counter + 1
 
+    #print(primer_counter)
+    
     all_matched = True
     for i in range(target_index + 1, len(alignments)):
 
@@ -380,17 +385,21 @@ def extractAmpliconAroundTarget(alignments, target):
         else:
             #print("MATCH")
             primer_counter = primer_counter + 1
+            # if we matched all primers, we have to quit no matter what
+            if primer_counter == len(fwd_primer_order):
+                break
 
 
+    # if we matched all in the primer sequence, extend to the end of the entire read
     if all_matched:
-        amplicon_end = alignments[-1].end
+        amplicon_end = -1
 
     #print("Trim end: ", amplicon_end)
         
     #####
     # look to the left
     #####
-    allowed_mismatches = 1
+    allowed_mismatches = 0
     #print("LOOKING LEFT")
     primer_counter = fwd_primer_order.index('T') if fwd_strand else rev_primer_order.index('Tc')
     primer_counter = primer_counter - 1
@@ -433,7 +442,86 @@ def extractAmpliconAroundTarget(alignments, target):
     #print("Trim start: ", amplicon_start)
         
     return amplicon_start, amplicon_end
+
+
+#####
+def getI(read):
+    return read.get_cigar_stats()[0][1]
+
+def getD(read):
+    return read.get_cigar_stats()[0][2]
+
+def getEq(read):
+    return read.get_cigar_stats()[0][7]
+
+def getX(read):
+    return read.get_cigar_stats()[0][8]
+
+def getAccuracy(read, alt_pos, alt_base):
+
+    Eq = getEq(read)
+    X = getX(read)
+    I = getI(read)
+    D = getD(read)
+
+    # adjust Eq and X if this is a suspected alt read
+    # find the alignment pair for the ref position
+    # query the query pos that corresponds, and check if the base is the alt base
+    for pair in read.get_aligned_pairs():
+        if pair[0] == None or pair[1] == None:
+            continue
+        if pair[1] == (alt_pos - 1):
+            print(pair)
+            print(len(read.query_alignment_sequence))
+            if read.query_alignment_sequence[pair[0]-read.query_alignment_start] == alt_base:
+                print("TUMOR")
+                Eq = Eq + 1
+                X = X - 1
+            else:
+                print("NORMAL")
+                
+    return (float(Eq) / float(Eq + I + X + D))
+
+#### parses CIGAR string and calc total errors.
+# ignores leading/trailing errors
+# can accept one alt base possibility/position pair to account for tumor reads
+# if an alt base is provided, a consensus vote for the alt at that position will
+# not be counted as an error
+def calcErrorRate(ref_fn, sam_fn, alt_pos = -1, alt_base ='N'):
+
+    samfile = pysam.AlignmentFile(sam_fn, 'r')
+
+    cumulative_err_rate = 0.0
+    cumulative_I_rate = 0.0
+    cumulative_D_rate = 0.0
+    cumulative_X_rate = 0.0
+    mapped_read_count = 0.0
+        
+    for read in samfile:
+        if not read.is_unmapped:
+            mapped_read_count += 1.0
+            #cigar = read.cigarstring
+            #print(cigar)
+            #print(stats[0])
+            #print(getAccuracy(read))
+            cumulative_err_rate += getAccuracy(read, alt_pos, alt_base)
+            #cumulative_I_rate += getI(read) / (getI(read) + getEq(read) + getD(read) + getX(read))
+            #cumulative_D_rate += getD(read) / (getI(read) + getEq(read) + getD(read) + getX(read))
+            #cumulative_X_rate += getX(read) / (getI(read) + getEq(read) + getD(read) + getX(read))
+            
+            
+    avg_err_rate = cumulative_err_rate / mapped_read_count
+            
+    #avg_I_rate = cumulative_I_rate / mapped_read_count
+    #avg_D_rate = cumulative_D_rate / mapped_read_count
+    #avg_X_rate = cumulative_X_rate / mapped_read_count
+
+    #print(avg_err_rate)
+    #print("Error {}% = {}%I {}%D {}%X".format(1.0-avg_err_rate, avg_I_rate, avg_D_rate, avg_X_rate))
+
+    return avg_err_rate
     
+
 ################################################
 
 # get file directory for relative script paths
@@ -477,18 +565,18 @@ sw = swalign.LocalAlignment(scoring)  # you can also choose gap penalties, etc..
 lamplicon = ''
 lamplicon_counter = 0
 
-alignment_identity_threshold = 0.85
+alignment_identity_threshold = 0.75
 
 single_lamplicon = True
 
 for lampli in lamplicons:
 
-    if single_lamplicon and lamplicon_counter < lamplicon_target:
-        lamplicon_counter = lamplicon_counter + 1
-        continue
+    #if single_lamplicon and lamplicon_counter < lamplicon_target:
+    #    lamplicon_counter = lamplicon_counter + 1
+    #    continue
     
-    if lamplicon_counter > lamplicon_target:
-        break
+    #if lamplicon_counter > lamplicon_target:
+    #    break
     
     lamplicon = lampli.seq
 
@@ -519,6 +607,10 @@ for lampli in lamplicons:
             # primer token chain extension
             seq_start, seq_end = extractAmpliconAroundTarget(alignments, alignment)
 
+            # if we get a -1 for seq end, it means we never matched to the right, so just grab the whole read
+            if seq_end == -1:
+                seq_end = len(lamplicon) - 1
+            
             # generate new read from lamplicon substring
             record = SeqRecord(
                 lamplicon[seq_start:seq_end],
@@ -526,11 +618,15 @@ for lampli in lamplicons:
                 "{}_{}".format(lamplicon_counter, target_counter),
                 "Lamplicon {} target {}".format(lamplicon_counter, target_counter)
             )
+
+            #
+            print("  {}:{}".format(seq_start, seq_end))
+            
             #print(record)
             targets.append(record)
             
     print("Found Targets: {}".format(target_counter))
-
+    
     # write targets to new fasta file
     print("Writing {} target sequences to {}_{}.fasta".format(target_counter, lamplicon_counter, target_counter))
     fasta_fn = "{}_{}.fasta".format(lamplicon_counter, target_counter)
@@ -538,24 +634,36 @@ for lampli in lamplicons:
         SeqIO.write(targets, output_handle, "fasta")
 
 
-    print("Generating consensus sequence and alignment...")
+    print("Generating alignments and consensus sequence...")
     # align targets to ref
     ref_fn = target_ref_fn
 
+    out_sam_temp = "{}_{}_temp.sam".format(lamplicon_counter,target_counter)
     out_sam = "{}_{}.sam".format(lamplicon_counter,target_counter)
     in_bam = "{}_{}.bam".format(lamplicon_counter,target_counter)
     
-    subprocess.run(["minimap2","-a","-xmap-ont","--eqx","-t 1","-w 1", "-o{}".format(out_sam),ref_fn,fasta_fn], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    subprocess.run(["minimap2","-a","-xmap-ont","--eqx","-t 1","-w 1","-n 1", "-N 0", "-m 0","-p 0.6","-s 30", "-o{}".format(out_sam_temp),ref_fn,fasta_fn], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
+    # filter secondary/supplementary alignments from sam file
+    # samtools view -h -F 0x900 filename.bam
+    subprocess.run(["samtools", "view", "-h", "-F 0x900", out_sam_temp, "-o{}".format(out_sam)])
+    
     # convert sam to bam
     subprocess.run([sam_to_bam, out_sam], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-    # generate consensus sequence
+    # generate consensus sequence if we had at least one valid alignment
+    mapped_reads = pysam.AlignmentFile(in_bam, 'rb').mapped
+    print("Mapped {} of {} targets".format(mapped_reads, target_counter))
+    if mapped_reads <= 1:
+        # consider next lamplicon candidate
+        lamplicon_counter = lamplicon_counter + 1
+        continue
+
     subprocess.run([generate_consensus, ref_fn, in_bam], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     fastq_cns_fn = "{}_{}_cns.fastq".format(lamplicon_counter, target_counter)
     out_cns_sam = "{}_{}_cns.sam".format(lamplicon_counter, target_counter)
 
-    # remove leading/trailing ambiguous characters
+    # remove leading/trailing ambiguous characters from consensus sequence
     for consensus_seq in SeqIO.parse(fastq_cns_fn, "fastq"):
 
         # find location of last n from the start
@@ -573,15 +681,20 @@ for lampli in lamplicons:
     with open(fastq_cns_fn, "w") as output_handle:
         SeqIO.write(consensus_seq, output_handle, "fastq")
     
-    
     # align consensus sequence
     subprocess.run(["minimap2","-a","-xmap-ont","--eqx","-t 1","-w 1", "-o{}".format(out_cns_sam),ref_fn,fastq_cns_fn], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
     # convert sam to bam
     subprocess.run([sam_to_bam, out_cns_sam], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-
     
     print("  DONE")
+
+    # computing error from each alignment (ignoring leading/trailing clips and accounting for mutations
+    orig_err = calcErrorRate(ref_fn, out_sam, 157, 'T')
+    cns_err = calcErrorRate(ref_fn, out_cns_sam, 157, 'T')
+
+    print("Orig Acc: {}%".format(orig_err*100))
+    print("Cons Acc: {}%".format(cns_err*100))
     
     # consider next lamplicon candidate
     lamplicon_counter = lamplicon_counter + 1
