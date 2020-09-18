@@ -3,6 +3,17 @@
 A LAMP concatemer (lamplicon) polisher to improve single read accuracy.
 
 ## Installation
+First, install `samtools-1.10`, `bcftools`, and `minimap2`.
+
+Next, install `lamprey`:
+```bash
+$ git clone https://github.com/jackwadden/lamprey
+$ cd lamprey
+$ python3.7 -m venv venv3 --prompt lamprey
+$ source venv3/bin/activate
+(lamprey) $ pip install --upgrade pip
+(lamprey) $ pip install -r requirements.txt
+```
 
 ## Usage
 

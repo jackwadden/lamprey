@@ -1,2 +1,8 @@
+venv*
+
 data/
 run.sh
+
+*.fasta
+*.bam*
+*.sam
