@@ -1,8 +1,6 @@
-#!/usr/bin/pyAthon
+#!/usr/bin/python
 
-import sys
-import os
-import subprocess
+import sys, os, subprocess, argparse
 
 import swalign
 import mappy
@@ -11,10 +9,6 @@ import pysam
 from Bio import SeqIO
 from Bio.SeqRecord import SeqRecord
 
-#########################
-# ??? why are there multiple options
-#fwd_primer_order = ['F3', 'F2', 'FLPc', 'F1', 'B1c', 'BLP', 'T', 'B2c', 'B3c']
-#rev_primer_order = ['B3', 'B2', 'Tc', 'BLPc', 'B1', 'F1c', 'FLP', 'F2c', 'F3c']
 fwd_primer_order = ['F3', 'F2', 'F1', 'B1c', 'T', 'B2c', 'B3c']
 rev_primer_order = ['B3', 'B2', 'Tc', 'B1', 'F1c', 'F2c', 'F3c']
 
@@ -236,6 +230,7 @@ def printPrimerAlignments(seq, alignments):
     Fancy printing of all primers aligned to sequence.
     '''
 
+    print("")
     print(seq)
     print(alignments)
 
@@ -318,11 +313,8 @@ def extractAmpliconAroundTarget(alignments, target):
     # is target forward or reverse?
     fwd_strand = target.primer_name == "T"
 
-    #print("Forward strand?: ",fwd_strand)
-
     # find target alignment index
     target_index = alignments.index(target)
-    #print("Target index: ", target_index)
 
     #####
     # look to the right 
@@ -343,9 +335,6 @@ def extractAmpliconAroundTarget(alignments, target):
         else:
             expected_primer_name = rev_primer_order[primer_counter]
 
-        #print("primer name: ", primer_name)
-        #print("expected primer name: ", expected_primer_name)
-
         # on a mismatch, end the search
         if primer_name != expected_primer_name:
 
@@ -354,36 +343,29 @@ def extractAmpliconAroundTarget(alignments, target):
             else:
                 # we've found our end, point, so make our end the last match end
                 amplicon_end = alignments[i-1].end
-                #print("MISMATCH!")
                 all_matched = False
                 break
         else:
-            #print("MATCH")
             primer_counter = primer_counter + 1
+
             # if we matched all primers, we have to quit no matter what
             if primer_counter == len(fwd_primer_order):
                 break
-
 
     # if we matched all in the primer sequence, extend to the end of the entire read
     if all_matched:
         amplicon_end = -1
 
-    #print("Trim end: ", amplicon_end)
-        
     #####
     # look to the left
     #####
     allowed_mismatches = 0
-    #print("LOOKING LEFT")
     primer_counter = fwd_primer_order.index('T') if fwd_strand else rev_primer_order.index('Tc')
     primer_counter = primer_counter - 1
 
     all_matched = True
     for i in range(target_index - 1, 0, -1):
 
-        #print(i)
-        
         # primer name
         primer_name = alignments[i].primer_name
 
@@ -392,9 +374,6 @@ def extractAmpliconAroundTarget(alignments, target):
             expected_primer_name = fwd_primer_order[primer_counter]
         else:
             expected_primer_name = rev_primer_order[primer_counter]
-
-        #print("primer name: ", primer_name)
-        #print("expected primer name: ", expected_primer_name)
 
         # on a mismatch, end the search
         if primer_name != expected_primer_name:
@@ -405,17 +384,13 @@ def extractAmpliconAroundTarget(alignments, target):
                 # we've found our end, point, so make our end the last match end
                 amplicon_start = alignments[i+1].start
                 all_matched = False
-                #print("MISMATCH!")
                 break
         else:
-            #print("MATCH")
             primer_counter = primer_counter - 1
 
     if all_matched:
         amplicon_start = 0
 
-    #print("Trim start: ", amplicon_start)
-        
     return amplicon_start, amplicon_end
 
 
@@ -454,14 +429,9 @@ def getAccuracy(read, alt_pos=None, alt_base=None):
         if pair[0] == None or pair[1] == None:
             continue
         if pair[1] == (alt_pos - 1):
-            print(pair)
-            print(len(read.query_alignment_sequence))
             if read.query_alignment_sequence[pair[0]-read.query_alignment_start] == alt_base:
-                print("TUMOR")
                 Eq = Eq + 1
                 X = X - 1
-            else:
-                print("NORMAL")
                 
     return (float(Eq) / float(Eq + I + X + D))
 
@@ -475,220 +445,182 @@ def calcErrorRate(ref_fn, sam_fn, alt_pos=None, alt_base=None):
     Calculate overall error rate in SAM file.
     '''
 
+    # init
     samfile = pysam.AlignmentFile(sam_fn, 'r')
-
     cumulative_err_rate = 0.0
-    cumulative_I_rate = 0.0
-    cumulative_D_rate = 0.0
-    cumulative_X_rate = 0.0
-    mapped_read_count = 0.0
-        
+    mapped_read_count = 0
+
+    # accumulate errors
     for read in samfile:
         if not read.is_unmapped:
-            mapped_read_count += 1.0
-            #cigar = read.cigarstring
-            #print(cigar)
-            #print(stats[0])
-            #print(getAccuracy(read))
+            mapped_read_count += 1
             cumulative_err_rate += getAccuracy(read, alt_pos, alt_base)
-            #cumulative_I_rate += getI(read) / (getI(read) + getEq(read) + getD(read) + getX(read))
-            #cumulative_D_rate += getD(read) / (getI(read) + getEq(read) + getD(read) + getX(read))
-            #cumulative_X_rate += getX(read) / (getI(read) + getEq(read) + getD(read) + getX(read))
 
+    # if no mapped reads, cumulative accuracy is 0
     if mapped_read_count == 0: return 0
-            
+
+    # return average error
     avg_err_rate = cumulative_err_rate / mapped_read_count
-            
-    #avg_I_rate = cumulative_I_rate / mapped_read_count
-    #avg_D_rate = cumulative_D_rate / mapped_read_count
-    #avg_X_rate = cumulative_X_rate / mapped_read_count
-
-    #print(avg_err_rate)
-    #print("Error {}% = {}%I {}%D {}%X".format(1.0-avg_err_rate, avg_I_rate, avg_D_rate, avg_X_rate))
-
     return avg_err_rate
     
 
 ################################################
 
-# get file directory for relative script paths
-dirname = os.path.dirname(__file__)
-generate_consensus = os.path.join(dirname, 'scripts/generate_consensus.sh')
-sam_to_bam = os.path.join(dirname, 'scripts/sam_to_bam.sh')
 
-# parse args
-args = sys.argv
+def main(args):
 
-# print usage
-if len(sys.argv) != 5:
-    print("usage: python3 lamp_aligner.py <target_ref.fa> <primer_set> <lamplicons.fq> <lamplicon_target>")
-    sys.exit(1)
+    # get file directory for relative script paths
+    dirname = os.path.dirname(__file__)
+    generate_consensus = os.path.join(dirname, 'scripts/generate_consensus.sh')
+    sam_to_bam = os.path.join(dirname, 'scripts/sam_to_bam.sh')
+    os.makedirs(args.output_dir, exist_ok=True)
 
-target_ref_fn = args[1]
-primer_set_fn = args[2]
-lamplicon_fn = args[3]
-lamplicon_target = int(args[4])
+    # parse all lamplicons from FASTQ file
+    print("> parsing lamplicons")
+    lamplicons = [l.seq for l in SeqIO.parse(args.lamplicons_fn, "fastq")]
 
+    # parse primers from config file
+    print("> parsing primers")
+    primers = PrimerSet(args.primer_set_fn)
 
-# parse reads
-#print("Parsing fastq file...")
-lamplicons = SeqIO.parse(lamplicon_fn, "fastq")
-#print("    Done.")
+    # initialize aligner
+    print("> initializing aligner")
+    match = 2
+    mismatch = -1
+    scoring = swalign.NucleotideScoringMatrix(match, mismatch)
+    sw = swalign.LocalAlignment(scoring)  # you can also choose gap penalties, etc...
 
-# parse lamp primers
-#print("Parsing lamp primers...")
-primers = PrimerSet(primer_set_fn)
-#print("    Done.")
+    # iterate over all lamplicon sequences
+    print("> splitting and mapping lamplicons")
+    for lamp_idx, lamplicon in enumerate(lamplicons):
 
-# prep aligner
-match = 2
-mismatch = -1
-scoring = swalign.NucleotideScoringMatrix(match, mismatch)
-sw = swalign.LocalAlignment(scoring)  # you can also choose gap penalties, etc...
+        # print status, stop early if we've found enough
+        if lamp_idx >= args.max_lamplicons: break
+        print("processing lamplicon {} of {}\r".format(lamp_idx+1, 
+                min(len(lamplicons), args.max_lamplicons)), end="")
+        
+        # optionally print alignments of all primers
+        if args.debug_print:
+            alignments = findAllPrimerAlignments(sw, lamplicon, primers, args.threshold)
+            printPrimerAlignments(lamplicon, alignments)
 
+        # get just alignments of templates
+        alignments = []
+        alignments.extend(findPrimerAlignments(
+                sw, lamplicon, primers.T, "T", args.threshold))
+        alignments.extend(findPrimerAlignments(
+                sw, lamplicon, rc(primers.T), "Tc", args.threshold))
 
-lamplicon = ''
-lamplicon_counter = 0
+        # gather targets into separate SeqIO Records
+        target_idx = 0
+        targets = []
+        for alignment in alignments:
+            if alignment.primer_name in ['T', 'Tc']:
+                
+                # extend sequence around target for better mapping
+                seq_start, seq_end = extractAmpliconAroundTarget(alignments, alignment)
 
-alignment_identity_threshold = 0.75
+                # if we get a -1 for seq end, we never matched to the right, 
+                # so just grab the whole read
+                if seq_end == -1:
+                    seq_end = len(lamplicon) - 1
+                
+                # generate new read from lamplicon substring
+                record = SeqRecord(
+                    lamplicon[seq_start:seq_end],
+                    "{}_{}".format(lamp_idx, target_idx),
+                    "{}_{}".format(lamp_idx, target_idx),
+                    "lamplicon {} target {}".format(lamp_idx, target_idx)
+                )
+                targets.append(record)
+                target_idx += 1
 
-single_lamplicon = True
-
-for lampli in lamplicons:
-
-    #if single_lamplicon and lamplicon_counter < lamplicon_target:
-    #    lamplicon_counter = lamplicon_counter + 1
-    #    continue
-    
-    #if lamplicon_counter > lamplicon_target:
-    #    break
-    
-    lamplicon = lampli.seq
-
-    alignments = findAllPrimerAlignments(sw, lamplicon, primers, alignment_identity_threshold)
-
-    alignments = sorted(alignments)
-
-    printPrimerAlignments(lamplicon, alignments)
-
-    target_counter = 0
-    targets = []
-    buf = 60
-
-    # gather targets into separate SeqIO Records
-    for alignment in alignments:
-        if alignment.primer_name in ['T', 'Tc']:
-            target_counter += 1
-            
-            # reach left and right to find concatemer cut points
-
-            # Naive implementation where we just consider target + buf and target - buf region
-            # didn't work nearly as well in practice as extending the chain to encompass as much of a full
-            # amplicon as possible
-            #seq_start = alignment.start - buf if (alignment.start - buf) > 0 else 0
-            #seq_end = alignment.end + buf if (alignment.end + buf) < len(lamplicon) else len(lamplicon) - 1
-
-            # primer token chain extension
-            seq_start, seq_end = extractAmpliconAroundTarget(alignments, alignment)
-
-            # if we get a -1 for seq end, it means we never matched to the right, so just grab the whole read
-            if seq_end == -1:
-                seq_end = len(lamplicon) - 1
-            
-            # generate new read from lamplicon substring
-            record = SeqRecord(
-                lamplicon[seq_start:seq_end],
-                "{}_{}".format(lamplicon_counter, target_counter),
-                "{}_{}".format(lamplicon_counter, target_counter),
-                "lamplicon {} target {}".format(lamplicon_counter, target_counter)
-            )
-
-            #
-            print("  {}:{}".format(seq_start, seq_end))
-            
-            #print(record)
-            targets.append(record)
-            
-    print("Found Targets: {}".format(target_counter))
-    
-    # write targets to new fasta file
-    print("Writing {} target sequences to {}_{}.fasta"\
-            .format(target_counter, lamplicon_counter, target_counter))
-    fasta_fn = "{}_{}.fasta".format(lamplicon_counter, target_counter)
-    with open(fasta_fn, "w") as output_handle:
-        SeqIO.write(targets, output_handle, "fasta")
-
-
-    print("Generating alignments and consensus sequence...")
-    # align targets to ref
-    ref_fn = target_ref_fn
-
-    out_sam_temp = "{}_{}_temp.sam".format(lamplicon_counter,target_counter)
-    out_sam = "{}_{}.sam".format(lamplicon_counter,target_counter)
-    in_bam = "{}_{}.bam".format(lamplicon_counter,target_counter)
-    
-    subprocess.run(["minimap2","-a","-xmap-ont","--eqx","-t 1","-w 1",
-        "-n 1", "-N 5", "--secondary=no", "-m 0","-p 0.6","-s 30", "-o{}".
-        format(out_sam_temp),ref_fn,fasta_fn], 
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-
-    # filter secondary/supplementary alignments from sam file
-    # samtools view -h -F 0x900 filename.bam
-    subprocess.run(["samtools", "view", "-h", "-F 0x900", out_sam_temp, "-o{}".format(out_sam)])
-    
-    # convert sam to bam
-    subprocess.run([sam_to_bam, out_sam], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-
-    # generate consensus sequence if we had at least one valid alignment
-    mapped_reads = pysam.AlignmentFile(in_bam, 'rb').mapped
-    print("Mapped {} of {} targets".format(mapped_reads, target_counter))
-    if mapped_reads <= 1:
-        # consider next lamplicon candidate
-        lamplicon_counter = lamplicon_counter + 1
-        continue
-
-    subprocess.run([generate_consensus, ref_fn, in_bam], 
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    fastq_cns_fn = "{}_{}_cns.fastq".format(lamplicon_counter, target_counter)
-    out_cns_sam = "{}_{}_cns.sam".format(lamplicon_counter, target_counter)
-
-    # remove leading/trailing ambiguous characters from consensus sequence
-    for consensus_seq in SeqIO.parse(fastq_cns_fn, "fastq"):
-
-        # find location of last n from the start
-        n_end = 0
-        while consensus_seq.seq[n_end].upper() == 'N':
-            n_end += 1
-
-        n_start = len(consensus_seq.seq) - 1
-        while consensus_seq.seq[n_start].upper() == 'N':
-            n_start -= 1
-
-        consensus_seq = consensus_seq[n_end:n_start+1]
-
-        # re-write consensus fastq
-        with open(fastq_cns_fn, "w") as output_handle:
-            SeqIO.write(consensus_seq, output_handle, "fastq")
-
-        break # should be a single consensus sequence
-    
-    # align consensus sequence
-    subprocess.run(["minimap2","-a","-xmap-ont","--eqx","-t 1","-w 1", "-o{}"\
-            .format(out_cns_sam),ref_fn,fastq_cns_fn], 
+        # skip lamplicon if it didn't contain any targets
+        if not target_idx: continue
+        
+        # write targets to new FASTA file
+        fasta_fn = "{}/{}.fasta".format(args.output_dir, lamp_idx)
+        with open(fasta_fn, "w") as output_handle:
+            SeqIO.write(targets, output_handle, "fasta")
+        
+        # map all reads, including secondary mappings 
+        out_sam_all = "{}/{}_all.sam".format(args.output_dir, lamp_idx)
+        subprocess.run(["minimap2","-a","-xmap-ont","--eqx","-t 1","-w 1",
+            "-n 1", "-N 5", "--secondary=no", "-m 0","-p 0.6","-s 30", "-o{}".
+            format(out_sam_all),args.target_ref_fn,fasta_fn], 
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-    # convert sam to bam
-    subprocess.run([sam_to_bam, out_cns_sam], 
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    print("  DONE")
+        # filter secondary/supplementary alignments from sam file
+        out_sam = "{}/{}.sam".format(args.output_dir, lamp_idx)
+        subprocess.run(["samtools", "view", "-h", "-F 0x900", out_sam_all, "-o{}".format(out_sam)])
+        
+        # convert sam to bam
+        subprocess.run([sam_to_bam, out_sam], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-    # computing error from each alignment (ignoring leading/trailing clips and accounting for mutations
-    orig_err = calcErrorRate(ref_fn, out_sam, 157, 'T')
-    cns_err = calcErrorRate(ref_fn, out_cns_sam, 157, 'T')
+        # no need to create consensus if we have one or fewer mapped targets
+        out_bam = "{}/{}.bam".format(args.output_dir, lamp_idx)
+        mapped_reads = pysam.AlignmentFile(out_bam, 'rb').mapped
+        if mapped_reads <= 1: continue
 
-    print("Orig Acc: {}%".format(orig_err*100))
-    print("Cons Acc: {}%".format(cns_err*100))
-    
-    # consider next lamplicon candidate
-    lamplicon_counter = lamplicon_counter + 1
+        # generate consensus sequence if multiple aligned targets
+        subprocess.run([generate_consensus, args.target_ref_fn, out_bam], 
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        fastq_cns_fn = "{}/{}_cns.fastq".format(args.output_dir, lamp_idx)
+        out_cns_sam = "{}/{}_cns.sam".format(args.output_dir, lamp_idx)
+
+        # remove leading/trailing ambiguous characters from consensus sequence
+        for consensus_seq in SeqIO.parse(fastq_cns_fn, "fastq"):
+
+            # find location of last n from the start
+            n_end = 0
+            while consensus_seq.seq[n_end].upper() == 'N':
+                n_end += 1
+            n_start = len(consensus_seq.seq) - 1
+            while consensus_seq.seq[n_start].upper() == 'N':
+                n_start -= 1
+
+            consensus_seq = consensus_seq[n_end:n_start+1]
+
+            # re-write consensus fastq
+            with open(fastq_cns_fn, "w") as output_handle:
+                SeqIO.write(consensus_seq, output_handle, "fastq")
+
+            break # should be a single consensus sequence
+        
+        # align consensus sequence
+        subprocess.run(["minimap2","-a","-xmap-ont","--eqx","-t 1","-w 1", "-o{}"\
+                .format(out_cns_sam), args.target_ref_fn, fastq_cns_fn], 
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+        # convert sam to bam
+        subprocess.run([sam_to_bam, out_cns_sam], 
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+        # computing error from each alignment (ignoring leading/trailing clips and accounting for mutations
+        orig_err = calcErrorRate(args.target_ref_fn, out_sam, 157, 'T')
+        cns_err = calcErrorRate(args.target_ref_fn, out_cns_sam, 157, 'T')
+
+    print("")
+
+
+
+def argparser():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("target_ref_fn")
+    parser.add_argument("primer_set_fn")
+    parser.add_argument("lamplicons_fn")
+    parser.add_argument("--output_dir", type=str, default="results")
+    parser.add_argument("--max_lamplicons", type=int, default=50)
+    parser.add_argument("--threshold", type=float, default=0.75,
+            help="Primer identity threshold for successful alignment")
+    parser.add_argument("--debug_print", action="store_true", default=False)
+
+    return parser
+
+
+
+if __name__ == "__main__":
+    parser = argparser()
+    args = parser.parse_args()
+    main(args)
 

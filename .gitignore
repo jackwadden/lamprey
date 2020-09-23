@@ -1,7 +1,10 @@
 venv*
 
 data/
+results/
 run.sh
+
+*.png
 
 *.fasta
 *.bam*
