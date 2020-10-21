@@ -10,15 +10,32 @@ import vcfpy
 from Bio import SeqIO
 from Bio.SeqRecord import SeqRecord
 
-# H33 Set 1 Order
-#fwd_primer_order = ['F3', 'F2', 'F1', 'B1c', 'T', 'B2c', 'B3c']
-#rev_primer_order = ['B3', 'B2', 'Tc', 'B1', 'F1c', 'F2c', 'F3c']
 
-# H31 Set 2 Order
-fwd_primer_order = ['F3', 'F2', 'F1', 'T', 'B1c', 'B2c', 'B3c']
-rev_primer_order = ['B3', 'B2', 'B1', 'Tc', 'F1c', 'F2c', 'F3c']
+#########################
+class bcolors:
+    HEADER = '\033[95m'
+    BLUE = '\033[94m'
+    CYAN = '\033[96m'
+    GREEN = '\033[32;1m'
+    BGREEN = '\033[32;7m'
+    WARNING = '\033[93m'
+    FAIL = '\033[91m'
+    ENDC = '\033[0m'
+    BOLD = '\033[1m'
+    UNDERLINE = '\033[4m'
 
+def print_blue(text):
+    sys.stdout.write(bcolors.BLUE + text + bcolors.ENDC)
 
+def print_cyan(text):
+    sys.stdout.write(bcolors.CYAN + text + bcolors.ENDC)
+
+def print_red(text):
+    sys.stdout.write(bcolors.FAIL + text + bcolors.ENDC)
+
+def print_green(text):
+    sys.stdout.write(bcolors.GREEN + text + bcolors.ENDC)
+    
 #########################
 class PrimerSet:
     '''
@@ -27,6 +44,10 @@ class PrimerSet:
     
     def __init__(self, primer_set_filename):
 
+        self.primer_dict = dict()
+        self.fwd_primer_order = ['F3', 'F2', 'F1', 'T', 'B1c', 'B2c', 'B3c']
+        self.rev_primer_order = ['B3', 'B2', 'B1', 'Tc', 'F1c', 'F2c', 'F3c']
+        
         # initialize primer set given file
         with open(primer_set_filename) as fp:
             for line in fp:
@@ -34,70 +55,41 @@ class PrimerSet:
                 # read lines in format <primer_name> <primer_seq>
                 line = line.strip()
                 if not line: continue
+                if line.startswith("#"): continue
                 fields = line.split(' ')
                 primer_name = fields[0]
+
+                # parse fwd_primer_order line
+                if primer_name == 'fwd_primer_order':
+
+                    # clear default
+                    self.fwd_primer_order.clear()
+
+                    for field in fields[1:]:
+                        self.fwd_primer_order.append(field)
+
+                    continue
+
+                # parse rev_primer_order line
+                if primer_name == 'rev_primer_order':
+
+                    # clear default
+                    self.rev_primer_order.clear()
+                    
+                    for field in fields[1:]:
+                        self.rev_primer_order.append(field)
+
+                    continue
+
+                # parse normal primer
                 primer_string = fields[1]
 
-                # set each primer
-                if primer_name == "F3":
-                    self.F3 = primer_string
-                if primer_name == "F3c":
-                    self.F3 = rc(primer_string)
-                elif primer_name == "B3":
-                    self.B3 = primer_string
-                elif primer_name == "B3c":
-                    self.B3 = rc(primer_string)
-                elif primer_name == "FIP":
-                    self.FIP = primer_string
-                elif primer_name == "BIP":
-                    self.BIP = primer_string
-                elif primer_name == "FLP":
-                    self.FLP = primer_string
-                elif primer_name == "BLP":
-                    self.BLP = primer_string
-                elif primer_name == "F1":
-                    self.F1 = primer_string
-                elif primer_name == "F1c":
-                    self.F1 = rc(primer_string)
-                elif primer_name == "F2":
-                    self.F2 = primer_string
-                elif primer_name == "F2c":
-                    self.F2 = rc(primer_string)
-                elif primer_name == "B1":
-                    self.B1 = primer_string
-                elif primer_name == "B1c":
-                    self.B1 = rc(primer_string)
-                elif primer_name == "B2":
-                    self.B2 = primer_string
-                elif primer_name == "B2c":
-                    self.B2 = rc(primer_string)
-                elif primer_name == "T":
-                    self.T = primer_string
-                elif primer_name == "Tc":
-                    self.T = rc(primer_string)
-                elif primer_name == "RAP_1":
-                    self.RAP_1 = primer_string
-                elif primer_name == "RAPc_1":
-                    self.RAP_1 = primer_string
-                elif primer_name == "RAP_2":
-                    self.RAP_2 = primer_string
-                elif primer_name == "RAPc_1":
-                    self.RAP_2 = primer_string
-                elif primer_name == "RAP_3":
-                    self.RAP_3 = primer_string
-                elif primer_name == "RAPc_3":
-                    self.RAP_3 = primer_string
-                elif primer_name == "FRA3pc_1":
-                    self.FRA3p = rc(primer_string)
-                elif primer_name == "FRA3p_2":
-                    self.FRA3p = primer_string
-                elif primer_name == "FRA3pc_2":
-                    self.FRA3p = rc(primer_string)
-                elif primer_name == "FRA5p":
-                    self.FRA5p = primer_string
-                elif primer_name == "FRA5pc":
-                    self.FRA5p = rc(primer_string)
-        
+                # also store revcomp version
+                if primer_name.endswith('c'):
+                    self.primer_dict[primer_name[:-1]] = rc(primer_string)
+                else:
+                    self.primer_dict[primer_name] = primer_string
+                        
 #########################
 class Alignment:
     '''
@@ -152,8 +144,8 @@ def findPrimerAlignments(aligner, seq, primer, primer_name, identity_threshold):
     
     # TODO: improve heuristic (50% threshold -> 25% match passes worst case)
     alignment_list = list()
-    if alignment.identity > identity_threshold and \
-			alignment_len > len(primer) * identity_threshold:
+    if alignment.identity >= identity_threshold and \
+			alignment_len >= len(primer) * identity_threshold:
         
         # add the optimal alignment to list of valid alignments
         alignment_list.append(alignment)
@@ -161,7 +153,7 @@ def findPrimerAlignments(aligner, seq, primer, primer_name, identity_threshold):
         # split the sequence into left/right sections based on the alignment
         left_seq = seq[:alignment.start]
         right_seq = seq[alignment.end:]
-                
+        
         # recurse left
         if len(left_seq) >= len(primer):
             left_alignments = findPrimerAlignments(
@@ -239,51 +231,55 @@ def findAllPrimerAlignments(aligner, seq, primers, identity_threshold):
 
     alignment_list = list()
 
-    alignment_list.extend(findPrimerAlignments(aligner, seq, primers.T, "T", identity_threshold))
-    alignment_list.extend(findPrimerAlignments(aligner, seq, rc(primers.T), "Tc", identity_threshold))
+    alignment_list.extend(findPrimerAlignments(aligner, seq, primers.primer_dict["T"], "T", identity_threshold))
+    alignment_list.extend(findPrimerAlignments(aligner, seq, rc(primers.primer_dict["T"]), "Tc", identity_threshold))
 
     # bail if we didn't find a target in this read
     # this is a lazy shortcut optimization
     #if len(alignment_list) == 0:
     #    return(sorted(alignment_list))
+
+    for primer_name, primer_seq in primers.primer_dict.items():
+        if primer_name == 'T':
+            continue
+        else:
+            # fwd
+            alignment_list.extend(findPrimerAlignments(aligner, seq, primer_seq, primer_name, identity_threshold))
+            # rc
+            alignment_list.extend(findPrimerAlignments(aligner, seq, rc(primer_seq), primer_name + "c", identity_threshold))
     
-    alignment_list.extend(findPrimerAlignments(aligner, seq, primers.F1, "F1", identity_threshold))
-    alignment_list.extend(findPrimerAlignments(aligner, seq, rc(primers.F1), "F1c", identity_threshold))
-    alignment_list.extend(findPrimerAlignments(aligner, seq, primers.F2, "F2", identity_threshold))
-    alignment_list.extend(findPrimerAlignments(aligner, seq, rc(primers.F2), "F2c", identity_threshold))
-    alignment_list.extend(findPrimerAlignments(aligner, seq, primers.F3, "F3", identity_threshold))
-    alignment_list.extend(findPrimerAlignments(aligner, seq, rc(primers.F3), "F3c", identity_threshold))
-    alignment_list.extend(findPrimerAlignments(aligner, seq, primers.B1, "B1", identity_threshold))
-    alignment_list.extend(findPrimerAlignments(aligner, seq, rc(primers.B1), "B1c", identity_threshold))
-    alignment_list.extend(findPrimerAlignments(aligner, seq, primers.B2, "B2", identity_threshold))
-    alignment_list.extend(findPrimerAlignments(aligner, seq, rc(primers.B2), "B2c", identity_threshold))
-    alignment_list.extend(findPrimerAlignments(aligner, seq, primers.B3, "B3", identity_threshold))
-    alignment_list.extend(findPrimerAlignments(aligner, seq, rc(primers.B3), "B3c", identity_threshold))
-
-    identity_threshold = 0.75
-    alignment_list.extend(findPrimerAlignments(aligner, seq, primers.RAP_1, "RAP_1", identity_threshold))
-    alignment_list.extend(findPrimerAlignments(aligner, seq, rc(primers.RAP_1), "RAPc_1", identity_threshold))
-    alignment_list.extend(findPrimerAlignments(aligner, seq, primers.RAP_2, "RAP_2", identity_threshold))
-    alignment_list.extend(findPrimerAlignments(aligner, seq, rc(primers.RAP_2), "RAPc_2", identity_threshold))
-    alignment_list.extend(findPrimerAlignments(aligner, seq, primers.RAP_2, "RAP_3", identity_threshold))
-    alignment_list.extend(findPrimerAlignments(aligner, seq, primers.RAP_2, "RAPc_3", identity_threshold))
-
-    alignment_list.extend(findPrimerAlignments(aligner, seq, primers.FRA3p, "FRA3p_1", identity_threshold))
-    alignment_list.extend(findPrimerAlignments(aligner, seq, rc(primers.FRA3p), "FRA3pc_1", identity_threshold))
-    alignment_list.extend(findPrimerAlignments(aligner, seq, primers.FRA3p, "FRA3p_2", identity_threshold))
-    alignment_list.extend(findPrimerAlignments(aligner, seq, rc(primers.FRA3p), "FRA3pc_2", identity_threshold))
-    alignment_list.extend(findPrimerAlignments(aligner, seq, primers.FRA5p, "FRA5p", identity_threshold))
-    alignment_list.extend(findPrimerAlignments(aligner, seq, rc(primers.FRA5p), "FRA5pc", identity_threshold))
-
-
-    #alignment_list.extend(findPrimerAlignments(aligner, seq, primers.BLP, "BLP", identity_threshold))
-    #alignment_list.extend(findPrimerAlignments(aligner, seq, rc(primers.BLP), "BLPc", identity_threshold))
-    #alignment_list.extend(findPrimerAlignments(aligner, seq, primers.FLP, "FLP", identity_threshold))
-    #alignment_list.extend(findPrimerAlignments(aligner, seq, rc(primers.FLP), "FLPc", identity_threshold))
-
     return(sorted(alignment_list))
     
 ###################
+def clearColor():
+    sys.stdout.write(u"\u001b[0m")
+    
+def setPrimerColor(primer_string):
+
+    color = ''
+    
+    if primer_string == 'T':
+        color = bcolors.BGREEN
+    elif primer_string == 'Tc':
+        color = bcolors.GREEN
+    elif primer_string == 'F2':
+        color = '\u001b[38;5;4;7m'
+    elif primer_string == 'F2c':
+        color = '\u001b[38;5;4m'
+    elif primer_string == 'F1':
+        color = '\u001b[38;5;75;7m'
+    elif primer_string == 'F1c':
+        color = '\u001b[38;5;75m'
+    elif primer_string == 'B2':
+        color = '\u001b[38;5;1;7m'
+    elif primer_string == 'B2c':
+        color = '\u001b[38;5;1m'
+    elif primer_string == 'B1':
+        color = '\u001b[38;5;204;7m'
+    elif primer_string == 'B1c':
+        color = '\u001b[38;5;204m'
+    sys.stdout.write(color)
+
 def printPrimerAlignments(seq, alignments):
     '''
     Fancy printing of all primers aligned to sequence.
@@ -308,13 +304,14 @@ def printPrimerAlignments(seq, alignments):
         # print the alignment if we're at the wrap factor OR end of the string
         if (pos > 0 and (pos+1) % wrap == 0) or pos == len(seq)-1:
             sys.stdout.write('\n')
-            
+
             # print corresponding alignment
             for aln_pos in range(wrap_counter * wrap, pos+1):
 
                 found_start = False
                 found_end = False
-                
+
+                    
                 # do we need to emit a spec char?
                 for alignment in alignments:
                     if alignment.start == aln_pos:                    
@@ -326,11 +323,20 @@ def printPrimerAlignments(seq, alignments):
                         found_end = True
                         primer_queue.pop()
 
+                # reset color
+                if found_primer:
+                    setPrimerColor(primer_string)
+                else:
+                    sys.stdout.write(bcolors.ENDC)
+           
+                        
                 # emit special char
                 if found_start and found_end:
                     sys.stdout.write('X')
                     found_primer = True
                 elif found_start:
+                    # turn on color
+                    setPrimerColor(primer_string)
                     sys.stdout.write('$')
                     found_primer = True
                 elif found_end:
@@ -349,8 +355,9 @@ def printPrimerAlignments(seq, alignments):
                             sys.stdout.write('-')
                     else:
                         sys.stdout.write(' ')
-
+                        
             # end alignment line
+            sys.stdout.write(bcolors.ENDC)
             sys.stdout.write('\n\n')
 
             # increment wrap counter
@@ -359,7 +366,7 @@ def printPrimerAlignments(seq, alignments):
     sys.stdout.write('\n')
 
 ################################################
-def removeOverlappingPrimerAlignments(alignments):
+def removeOverlappingPrimerAlignments(alignments, allowed_overlap):
 
     new_alignments = list()
     overlapping_alignments = list()
@@ -377,7 +384,7 @@ def removeOverlappingPrimerAlignments(alignments):
             continue
 
         # if this alignment overlaps with the last alignment, pick a winner
-        if alignment.start < last_alignment.end:
+        if alignment.start < last_alignment.end - allowed_overlap:
 
             print(str(alignment.start) + " : " + str(alignment.end))
 
@@ -399,7 +406,7 @@ def removeOverlappingPrimerAlignments(alignments):
 
     
 ###################
-def extractAmpliconAroundTarget(alignments, target):
+def extractAmpliconAroundTarget(primer_set, alignments, target):
     '''
     Target sequence was found in lamplicon. Extend this sequence as far as 
     possible both left and right (including primers) to increase mappability.
@@ -419,7 +426,7 @@ def extractAmpliconAroundTarget(alignments, target):
     # look to the right 
     #####
     allowed_mismatches = 0
-    primer_counter = fwd_primer_order.index('T') if fwd_strand else rev_primer_order.index('Tc')
+    primer_counter = primer_set.fwd_primer_order.index('T') if fwd_strand else primer_set.rev_primer_order.index('Tc')
     primer_counter = primer_counter + 1
 
     all_matched = True
@@ -430,9 +437,9 @@ def extractAmpliconAroundTarget(alignments, target):
 
         # expected primer name
         if fwd_strand:
-            expected_primer_name = fwd_primer_order[primer_counter]
+            expected_primer_name = primer_set.fwd_primer_order[primer_counter]
         else:
-            expected_primer_name = rev_primer_order[primer_counter]
+            expected_primer_name = primer_set.rev_primer_order[primer_counter]
 
         # on a mismatch, end the search
         if primer_name != expected_primer_name:
@@ -448,7 +455,7 @@ def extractAmpliconAroundTarget(alignments, target):
             primer_counter = primer_counter + 1
 
             # if we matched all primers, we have to quit no matter what
-            if primer_counter == len(fwd_primer_order):
+            if primer_counter == len(primer_set.fwd_primer_order):
                 break
 
     # if we matched all in the primer sequence, extend to the end of the entire read
@@ -459,7 +466,7 @@ def extractAmpliconAroundTarget(alignments, target):
     # look to the left
     #####
     allowed_mismatches = 0
-    primer_counter = fwd_primer_order.index('T') if fwd_strand else rev_primer_order.index('Tc')
+    primer_counter = primer_set.fwd_primer_order.index('T') if fwd_strand else primer_set.rev_primer_order.index('Tc')
     primer_counter = primer_counter - 1
 
     all_matched = True
@@ -470,9 +477,9 @@ def extractAmpliconAroundTarget(alignments, target):
 
         # expected primer name
         if fwd_strand:
-            expected_primer_name = fwd_primer_order[primer_counter]
+            expected_primer_name = primer_set.fwd_primer_order[primer_counter]
         else:
-            expected_primer_name = rev_primer_order[primer_counter]
+            expected_primer_name = primer_set.rev_primer_order[primer_counter]
 
         # on a mismatch, end the search
         if primer_name != expected_primer_name:
@@ -565,21 +572,22 @@ def calcErrorRate(ref_fn, sam_fn, alt_pos=None, alt_base=None):
 
 ################################################
 def extractPileupInfo(pileup_fn, contig, locus):
-    # parse lines in the pileup, extract the coverage
+    # parse lines in the pileup, extract the depth at the locus
 
     ref = ''
-    coverage = ''
+    depth = 0
     code_string = ''
-    
+    covers_roi = False
     with open(pileup_fn) as fp:
         for line in fp:
             fields = line.split('\t')
             if fields[0] == contig and int(fields[1]) == locus:
                 ref = fields[2]
-                coverage = int(fields[3])
+                depth = int(fields[3])
                 code_string = fields[4]
-
-    return ref, coverage, code_string
+                covers_roi = True
+                
+    return ref, depth, code_string, covers_roi
 
 ################################################
 def generatePileup(bam_to_pileup_sh, ref_fn, bam_fn, out_fn):
@@ -587,29 +595,121 @@ def generatePileup(bam_to_pileup_sh, ref_fn, bam_fn, out_fn):
     subprocess.run([bam_to_pileup_sh, ref_fn, bam_fn], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 ################################################
+def parseVCF(vcf_fn):
 
-def processLamplicon(sw, generate_consensus_path, sam_to_bam_path, bam_to_pileup_path, lamp_idx, lamplicon, primers, args):
+    reader = vcfpy.Reader.from_path(vcf_fn)
+
+    # extract variant roi
+    for record in reader:
+        return record
+
+    return
+    
 
 
-    alignments = findAllPrimerAlignments(sw, lamplicon, primers, args.threshold)
+################################################
+def processLamplicon(sw, generate_consensus_path, sam_to_bam_path, bam_to_pileup_path, minimap2, lamp_idx, lamplicon, primers, vcf_record, args):
+
+
+    # track how many votes each has
+    mut = 0
+    wt = 0
+    
+    alignments = findAllPrimerAlignments(sw, lamplicon.seq, primers, args.threshold)
     if len(alignments) > 0:
-        alignments = removeOverlappingPrimerAlignments(alignments)
+        # remove alignments that overlap by more than 4bp
+        alignments = removeOverlappingPrimerAlignments(alignments, 4)
 
     # optionally print alignments of all primers
     if args.debug_print:
-        printPrimerAlignments(lamplicon, alignments)
+        printPrimerAlignments(lamplicon.seq, alignments)
 
             
     # does this lamplicon possibly cover the target?
     num_targets = 0
+    num_ont_seqs = 0
     for alignment in alignments:
         if alignment.primer_name in ['T', 'Tc']:
             num_targets = num_targets + 1
 
-    # lazy exit if there were no targets identified over the threshold
+        # track high quality ont sequences
+        if alignment.primer_name.startswith('ont') and alignment.identity >= 0.8:
+            num_ont_seqs = num_ont_seqs + 1
+        
+    # if there were no targets identified over the threshold
+    # classify the read
     if num_targets == 0:
-        return num_targets
-    
+
+        print("Didn't find any targets.... diagnosing...")
+        
+        # classify read as "ont" if it contains > 1 ONT sequence and fewer than 2 other suspected primer seqs and greater than 50% coverage
+        if num_ont_seqs > 0 and (len(alignments) - 2) <= num_ont_seqs :
+
+            # get alignment coverage
+            seq_length = len(lamplicon.seq)
+            primer_coverage = 0
+            for alignment in alignments:
+                primer_coverage = primer_coverage + (alignment.end - alignment.start)
+                print(primer_coverage)
+
+            alignment_coverage = float(primer_coverage)/float(seq_length)
+            if alignment_coverage > 0.15:
+                classification = 'ont'
+            else:
+                # assume unknown
+                classification = 'unknown'
+
+                # try to align the read to see if it's a background genomic read
+                for hit in minimap2.map(lamplicon.seq):
+                    classification = 'background'
+
+            return num_targets, classification, mut, wt
+                    
+            
+        # classify the read as no_target (bad/erroneous primer amplification) if it has at least 3 primer sequences but no target
+        if len(alignments) >= 3:
+            classification = 'no_target'
+            return num_targets, classification, mut, wt
+
+        # this is maybe a background genomic read
+        # try to align the read to see if it's a background genomic read
+        # if we have any hits, classify as background
+        for hit in minimap2.map(lamplicon.seq):
+            classification = 'background'
+            return num_targets, classification, mut, wt
+        
+        # if there aren't any ont sequences or target/lamp sequences, then let's try to align this read to the human genome
+        # write separated targets to new FASTA file
+        #fastq_fn = "{}/tmp.fastq".format(args.output_dir)
+        #with open(fastq_fn, "w") as output_handle:
+        #    SeqIO.write(lamplicon, output_handle, "fastq")
+        
+        # map each target sequence; ignore secondary mappings 
+        #out_sam_tmp = "{}/tmp.sam".format(args.output_dir)
+        #subprocess.run(["minimap2","-a","-xmap-ont","--eqx","-t 1",
+        #                "-n 1", "-N 5", "--secondary=no", "-m 0", "-o{}".
+        #                format(out_sam_tmp),args.human_ref_fn,fastq_fn])
+
+        
+        #               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+        # parse sam file and see if there was a mapping to the human genome
+
+        #samfile = pysam.AlignmentFile(out_sam_tmp, 'r')
+        #for read in samfile:
+        #    if not read.is_unmapped:
+        #        classification = 'off_target'
+
+        # suspiciously short sequences might just be a fragment that can't align with enough identity
+        if len(lamplicon.seq) < 60:
+            classification = 'short'
+        else:
+            # final default to unknown
+            classification = 'unknown'
+        
+        return num_targets, classification, mut, wt
+
+    # if we found a target....
     # extend each target into a single amplicon and emit as fasta
     target_idx = 0
     targets = []
@@ -618,18 +718,18 @@ def processLamplicon(sw, generate_consensus_path, sam_to_bam_path, bam_to_pileup
         if alignment.primer_name == 'T' or alignment.primer_name == 'Tc':
         
             # extend sequence around target for better mapping
-            seq_start, seq_end = extractAmpliconAroundTarget(alignments, alignment)
+            seq_start, seq_end = extractAmpliconAroundTarget(primers, alignments, alignment)
         
             # if we get a -1 for seq end, we never matched to the right, 
             # so just grab the whole read
             if seq_end == -1:
-                seq_end = len(lamplicon) - 1
+                seq_end = len(lamplicon.seq) - 1
 
             print(str(seq_start) + " : " + str(seq_end))
             
-            # generate new read from lamplicon substring
+            # generate new read from lamplicon.seq substring
             record = SeqRecord(
-                lamplicon[seq_start:seq_end],
+                lamplicon.seq[seq_start:seq_end],
                 "{}_{}".format(lamp_idx, target_idx),
                 "{}_{}".format(lamp_idx, target_idx),
                 "lamplicon {} target {}".format(lamp_idx, target_idx)
@@ -661,20 +761,41 @@ def processLamplicon(sw, generate_consensus_path, sam_to_bam_path, bam_to_pileup
         
     # generate pileup
     subprocess.run([bam_to_pileup_path, args.target_ref_fn, out_bam], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    #subprocess.run([bam_to_pileup_path, args.target_ref_fn, out_bam])
 
     pileup_fn = "{}/{}.pileup".format(args.output_dir, lamp_idx)
         
     # extract pileup info
-    #H31
-    ref, coverage, code_string = extractPileupInfo(pileup_fn, "HIST1H3B", 459)
-    print(ref, coverage, code_string)
-        
+    ref, depth, code_string, covers_roi = extractPileupInfo(pileup_fn, vcf_record.CHROM, vcf_record.POS)
+
+    for alt in vcf_record.ALT:
+        variant = alt.value.upper()
+    
+    print("Pileup result: ",ref, depth, code_string, covers_roi)
+
+    # if we don't cover the roi, then this was probably a spurious target sequence, classify as a "no_target"
+    if not covers_roi:
+        classification = 'no_target'
+        return num_targets, classification, mut, wt
+    
+    # parse code string and set mut/wt
+    for char in code_string:
+        if char == ',' or char == '.':
+            wt = wt + 1
+        elif char == variant.upper() or char == variant.lower():
+            mut = mut + 1
+
+    print("Found {} mut and {} wt".format(mut,wt))
+            
+    # num targets is now the actual depth from the pileup
+    num_targets = depth
+
     # polish using script
     if not args.skip_consensus_polishing:
         # no need to create consensus if we have one or fewer mapped targets
 
         mapped_reads = pysam.AlignmentFile(out_bam, 'rb').mapped
-        if mapped_reads <= 1: return num_targets
+        if mapped_reads <= 1: return num_targets, 'target', mut, wt
 
         # generate consensus sequence if multiple aligned targets
         subprocess.run([generate_consensus_path, args.target_ref_fn, out_bam], 
@@ -714,23 +835,26 @@ def processLamplicon(sw, generate_consensus_path, sam_to_bam_path, bam_to_pileup
         subprocess.run([sam_to_bam_path, out_cns_sam], 
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-        # computing error from each alignment (ignoring leading/trailing clips and accounting for mutations
-            
-        #TODO: parse a VCF file or something or targets
-        # H3.3 
-        #orig_err = calcErrorRate(args.target_ref_fn, out_sam, 157, 'T')
-        #cns_err = calcErrorRate(args.target_ref_fn, out_cns_sam, 157, 'T')
-            
-        # H3.1
-        orig_err = calcErrorRate(args.target_ref_fn, out_sam, 459, 'A')
-        cns_err = calcErrorRate(args.target_ref_fn, out_cns_sam, 459, 'A')
+        # computing error from each alignment (ignoring leading/trailing clips and accounting for mutation    
+        orig_err = calcErrorRate(args.target_ref_fn, out_sam, vcf_record.POS, variant)
+        cns_err = calcErrorRate(args.target_ref_fn, out_cns_sam, vcf_record.POS, variant)
             
         print("Orig Acc: {}%".format(orig_err*100))
         print("Cons Acc: {}%".format(cns_err*100))
         
         # return whether or not this sequence had a target
-            
-    return num_targets
+
+    if num_targets == 0:
+        if len(alignments) >= 2:
+            classification = 'no_target'
+        elif len(lamplicon.seq) < 60:
+            classification = 'short'
+        else:
+            classification = 'unknown'
+    else:
+        classification = 'target'
+
+    return num_targets, classification, mut, wt
         
         
 def main(args):
@@ -751,35 +875,96 @@ def main(args):
     print("> parsing primers")
     primers = PrimerSet(args.primer_set_fn)
 
+    # parse VCF file if there is one
+    if args.vcf_fn != '':
+        vcf_record = parseVCF(args.vcf_fn)
+    
     # initialize aligner
-    print("> initializing aligner")
+    print("> initializing aligners")
     match = 2
     mismatch = -1
     scoring = swalign.NucleotideScoringMatrix(match, mismatch)
     sw = swalign.LocalAlignment(scoring)  # you can also choose gap penalties, etc...
 
+    # set up a mappy instance to align reads
+    minimap2 = mappy.Aligner(args.human_ref_fn)  # load or build index
+    if not minimap2: raise Exception("ERROR: failed to load/build index")
+    
     # iterate over all lamplicon sequences
     print("> splitting and mapping lamplicons")
     target_records = list()
-    off_target_records = list()
+    ont_records = list()
+    suspected_background_records = list()
+    unknown_records = list()
 
     # histogram data structures
     target_sequence_map = dict()
     
     # process each record
+    class_counters = dict()
+    class_counters['target'] = 0
+    class_counters['no_target'] = 0
+    class_counters['ont'] = 0
+    class_counters['background'] = 0
+    class_counters['short'] = 0
+    class_counters['unknown'] = 0
+
+
+    mut_total = 0
+    wt_total = 0
+
+    mut_reads = 0
+    wt_reads = 0
+
+
     for lamp_idx,lamplicon in enumerate(lamplicons):
         
         # print status, stop early if we've found enough
         if args.max_lamplicons > 0 and lamp_idx >= args.max_lamplicons: break
         
-        print("processing lamplicon {} \r".format(lamp_idx + 1), end="")
+        print_green("Processing Lamplicon {} \r".format(lamp_idx + 1))
+        
+        num_targets,classification,mut,wt = processLamplicon(sw,
+                                                             generate_consensus_path,
+                                                             sam_to_bam_path,
+                                                             bam_to_pileup_path,
+                                                             minimap2,
+                                                             lamp_idx,
+                                                             lamplicon,
+                                                             primers,
+                                                             vcf_record,
+                                                             args);
 
-        num_targets = processLamplicon(sw, generate_consensus_path, sam_to_bam_path, bam_to_pileup_path, lamp_idx, lamplicon.seq, primers, args);
+        # disaggregated totals (each target gets a vote)
+        mut_total = mut_total + mut
+        wt_total = wt_total + wt
 
-        if num_targets > 0:
-            target_records.append(lamplicon)
-        else:
-            off_target_records.append(lamplicon)
+        # aggregated totals (each lamplicon gets a vote)
+        if mut > 0 and mut > wt:
+            mut_reads = mut_reads + 1
+        elif wt > 0 and wt >= mut:
+            wt_reads = wt_reads + 1
+        
+        print(class_counters)        
+        class_counters[classification] = class_counters[classification] + 1
+        print(classification)
+        print(class_counters)
+
+        
+        if (mut_total + wt_total) > 0:
+            print("Disagg VAF: {}/{} {}".format(mut_total, mut_total + wt_total, float(mut_total)/(float(mut_total)+float(wt_total))))
+            print("Aggreg VAF: {}/{} {}".format(mut_reads, mut_reads + wt_reads, float(mut_reads)/(float(mut_reads)+float(wt_reads))))
+        
+        #if classification == 'target':
+        #    target_records.append(lamplicon)
+        #elif classification == 'no_target':
+        #    no_target_records.append(lamplicon)
+        #elif classification == 'ont':
+        #    ont_records.append(lamplicon)
+        #elif classification == 'background':
+        #    background_records.append(lamplicon)
+        #elif classification == 'unknown':
+        #    unknown_records.append(lamplicon)
 
 
         # keep track of each sequence based on how many targets they have
@@ -788,27 +973,38 @@ def main(args):
 
         target_sequence_map[num_targets].append(lamplicon)
 
+
+        
+        # sort the target count histogram
+        target_sequence_map = collections.OrderedDict(sorted(target_sequence_map.items()))
+
         
     print("")
 
-    # sort the target count histogram
-    target_sequence_map = collections.OrderedDict(sorted(target_sequence_map.items()))
     
     if(args.save_target_reads):
         # write out on-target/off-target splits
-        with open("{}/all_on_target.fastq".format(args.output_dir), "w") as output_handle:
+        with open("{}/target_records.fastq".format(args.output_dir), "w") as output_handle:
             SeqIO.write(target_records, output_handle, "fastq")
 
-        with open("{}/all_off_target.fastq".format(args.output_dir), "w") as output_handle:
-            SeqIO.write(off_target_records, output_handle, "fastq")
+        with open("{}/ont_records.fastq".format(args.output_dir), "w") as output_handle:
+            SeqIO.write(ont_records, output_handle, "fastq")
+
+        with open("{}/unknown_records.fastq".format(args.output_dir), "w") as output_handle:
+            SeqIO.write(unknown_records, output_handle, "fastq")
 
     
     # print summary stats
     if args.print_summary_stats:
+        total_records = len(target_records) + len(ont_records) + len(unknown_records)
         results_str = ''
         results_str = results_str + "> SUMMARY Statistics:\n"
-        results_str = results_str + "> Examined {} lamplicons\n".format(len(target_records) + len(off_target_records))
-        results_str = results_str + ">  Found {}/{} suspected target lamplicons\n".format(len(target_records), len(target_records) + len(off_target_records))
+        results_str = results_str + "> Examined {} lamplicons\n".format(total_records)
+        results_str = results_str + ">  Found {}/{} suspected target lamplicons\n".format(len(target_records), total_records)
+        results_str = results_str + ">  Found {}/{} suspected ont sequences\n".format(len(ont_records), total_records)
+        results_str = results_str + ">  Found {}/{} sequences of unknown origin\n".format(len(unknown_records), total_records)
+        results_str = results_str + ">  Disaggregate VAF (each target gets a vote): {}/{}\n".format(mut_total,(mut_total+wt_total))
+        results_str = results_str + ">  Aggregate VAF (each lamplicon gets a vote): {}/{}\n".format(mut_reads,(mut_reads+wt_reads))
         results_str = results_str + ">  Concatemer Length Histogram:\n"
         for num_targets, target_read_list in target_sequence_map.items():
             results_str = results_str + ">    {} : {}\n".format(num_targets, len(target_read_list))
@@ -818,7 +1014,6 @@ def main(args):
     # write stats to output file
     with open("{}/summary_stats.txt".format(args.output_dir), "w") as output_handle:
         output_handle.write(results_str)
-
             
     if args.save_concatemers:
         with open("{}/{}_targets.fastq".format(args.output_dir, num_targets), "w") as output_handle:
@@ -829,10 +1024,11 @@ def main(args):
 def argparser():
     parser = argparse.ArgumentParser()
     parser.add_argument("target_ref_fn")
+    parser.add_argument("human_ref_fn")
     parser.add_argument("primer_set_fn")
     parser.add_argument("lamplicons_fn")
     parser.add_argument("--output_dir", type=str, default="results")
-    parser.add_argument("--vcf", type=str, default='')
+    parser.add_argument("--vcf_fn", type=str, default='')
     parser.add_argument("--max_lamplicons", type=int, default=-1)
     parser.add_argument("--threshold", type=float, default=0.80,
             help="Primer identity threshold for successful alignment")
