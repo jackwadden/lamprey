@@ -2,10 +2,19 @@
 
 import sys, os, subprocess, argparse, collections
 
+import random as rng
+
+#sys.path.append(os.path.join(os.path.dirname(os.path.realpath(__file__)), './swalign'))
 import swalign
+
 import mappy
 import pysam
 import vcfpy
+import numpy as np
+import statsmodels.api as sm
+
+# temporary
+
 
 from Bio import SeqIO
 from Bio.SeqRecord import SeqRecord
@@ -122,7 +131,7 @@ def alignPrimer(aligner, seq, primer, primer_name):
     Aligns a primer to a DNA sequence.
     '''
 
-    alignment_tmp = aligner.align(seq, primer)
+    alignment_tmp = aligner.align(str(seq), primer)
     alignment = Alignment(alignment_tmp.r_pos,
                           alignment_tmp.r_end,
                           alignment_tmp.identity,
@@ -568,7 +577,46 @@ def calcErrorRate(ref_fn, sam_fn, alt_pos=None, alt_base=None):
     # return average error
     avg_err_rate = cumulative_err_rate / mapped_read_count
     return avg_err_rate
-    
+
+
+################################################
+def parsePileupCodeString(code_string, variant):
+
+    variant_count = 0
+    ref_count = 0
+    total_count = 0
+    skip_counter = 0
+    set_skip = False
+
+    for c in code_string:
+
+        #print(c)                                                                                                                                                            
+
+        if(skip_counter > 0):
+            skip_counter = skip_counter - 1
+            continue
+
+        if(set_skip):
+            skip_counter = int(c)
+            set_skip = False
+            continue
+
+        total_count = total_count + 1
+
+        if c == ',' or c == '.':
+            ref_count = ref_count + 1
+
+        elif c == variant or c == variant.lower():
+            variant_count = variant_count + 1
+
+        elif c == '-' or c == '+':
+            set_skip = True
+
+        elif c == '^':
+            skip_counter = 1
+
+    return ref_count, variant_count
+                          
 
 ################################################
 def extractPileupInfo(pileup_fn, contig, locus):
@@ -594,6 +642,24 @@ def generatePileup(bam_to_pileup_sh, ref_fn, bam_fn, out_fn):
 
     subprocess.run([bam_to_pileup_sh, ref_fn, bam_fn], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
+################################################
+def proportionConfidenceInterval(mut, wt, conf):
+
+
+    conf_int = sm.stats.proportion_confint(count=mut,
+                                           nobs=mut+wt,
+                                           alpha=(1 - conf))
+
+    samp_mean = float(mut)/float(mut + wt) * 100.0
+    if conf_int[0] == 0.0:
+        low = 0.0
+    else:
+        low = samp_mean - conf_int[0] * 100.0
+    high = conf_int[1] * 100.0 - samp_mean
+
+    #print("conf:", conf, "%.2f" % low, " -- ", "%.2f" % samp_mean, " -- ", "%.2f" % high, ")")
+    print("conf:", conf, "%.4f" % (conf_int[0]*100.0), " -- ", "%.2f" % samp_mean, " -- ", "%.4f" % (conf_int[1]*100.0), ")")
+    
 ################################################
 def parseVCF(vcf_fn):
 
@@ -633,7 +699,7 @@ def processLamplicon(sw, generate_consensus_path, sam_to_bam_path, bam_to_pileup
             num_targets = num_targets + 1
 
         # track high quality ont sequences
-        if alignment.primer_name.startswith('ont') and alignment.identity >= 0.8:
+        if alignment.primer_name.startswith('ont') and alignment.identity >= args.threshold:
             num_ont_seqs = num_ont_seqs + 1
         
     # if there were no targets identified over the threshold
@@ -761,7 +827,6 @@ def processLamplicon(sw, generate_consensus_path, sam_to_bam_path, bam_to_pileup
         
     # generate pileup
     subprocess.run([bam_to_pileup_path, args.target_ref_fn, out_bam], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    #subprocess.run([bam_to_pileup_path, args.target_ref_fn, out_bam])
 
     pileup_fn = "{}/{}.pileup".format(args.output_dir, lamp_idx)
         
@@ -778,12 +843,8 @@ def processLamplicon(sw, generate_consensus_path, sam_to_bam_path, bam_to_pileup
         classification = 'no_target'
         return num_targets, classification, mut, wt
     
-    # parse code string and set mut/wt
-    for char in code_string:
-        if char == ',' or char == '.':
-            wt = wt + 1
-        elif char == variant.upper() or char == variant.lower():
-            mut = mut + 1
+    # parse code string and set mut/wt counts
+    wt, mut = parsePileupCodeString(code_string, variant)
 
     print("Found {} mut and {} wt".format(mut,wt))
             
@@ -804,7 +865,6 @@ def processLamplicon(sw, generate_consensus_path, sam_to_bam_path, bam_to_pileup
         out_cns_sam = "{}/{}_cns.sam".format(args.output_dir, lamp_idx)
 
         # remove leading/trailing ambiguous characters from consensus sequence
-            
         for consensus_seq in SeqIO.parse(fastq_cns_fn, "fastq"):
 
             # find location of last n from the start
@@ -910,6 +970,9 @@ def main(args):
     class_counters['unknown'] = 0
 
 
+    # seed PRNG for VAF calcs
+    rng.seed(7)
+    
     mut_total = 0
     wt_total = 0
 
@@ -935,6 +998,21 @@ def main(args):
                                                              vcf_record,
                                                              args);
 
+
+        # here, we can hijack the classification and inject our own VAF
+        target_vaf = 0.1
+        if classification == "target":
+            # roll the dice based on the VAF
+            # adjust mut/wt calls depending on the result of the dice
+            if rng.random() < target_vaf:
+                mut = mut + wt
+                wt = 0
+            else:
+                # IMPORTANT: don't do anything to preserve error in wt dataset
+                mut = mut
+                wt = wt
+            
+        
         # disaggregated totals (each target gets a vote)
         mut_total = mut_total + mut
         wt_total = wt_total + wt
@@ -954,7 +1032,13 @@ def main(args):
         if (mut_total + wt_total) > 0:
             print("Disagg VAF: {}/{} {}".format(mut_total, mut_total + wt_total, float(mut_total)/(float(mut_total)+float(wt_total))))
             print("Aggreg VAF: {}/{} {}".format(mut_reads, mut_reads + wt_reads, float(mut_reads)/(float(mut_reads)+float(wt_reads))))
-        
+
+            proportionConfidenceInterval(mut_reads, wt_reads, 0.95)
+            proportionConfidenceInterval(mut_reads, wt_reads, 0.99)
+            proportionConfidenceInterval(mut_reads, wt_reads, 0.999)
+            proportionConfidenceInterval(mut_reads, wt_reads, 0.9999)
+
+
         #if classification == 'target':
         #    target_records.append(lamplicon)
         #elif classification == 'no_target':
