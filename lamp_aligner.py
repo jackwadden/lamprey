@@ -4,7 +4,8 @@ import sys, os, subprocess, argparse, collections
 
 import random as rng
 
-#sys.path.append(os.path.join(os.path.dirname(os.path.realpath(__file__)), './swalign'))
+# use local swalign?
+sys.path.insert(0, '/home/dna/software/swalign')
 import swalign
 
 import mappy
@@ -12,9 +13,6 @@ import pysam
 import vcfpy
 import numpy as np
 import statsmodels.api as sm
-
-# temporary
-
 
 from Bio import SeqIO
 from Bio.SeqRecord import SeqRecord
@@ -1168,5 +1166,15 @@ def argparser():
 if __name__ == "__main__":
     parser = argparser()
     args = parser.parse_args()
+
+    
+    #import cProfile, pstats
+    #profiler = cProfile.Profile()
+    #profiler.enable()
+
     main(args)
 
+    #profiler.disable()
+    #stats = pstats.Stats(profiler).sort_stats('tottime')
+    #stats.print_stats()
+    #stats.dump_stats('profile.dat')
