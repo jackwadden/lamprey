@@ -238,7 +238,7 @@ def pruneRapidAdapters(aligner, seq):
         alignment.dump()
 
 ##################
-def findAllPrimerAlignments(aligner, seq, primers, identity_threshold):
+def findAllPrimerAlignments(aligner, seq, primers, identity_threshold, args):
 
     alignment_list = list()
 
@@ -250,6 +250,9 @@ def findAllPrimerAlignments(aligner, seq, primers, identity_threshold):
     #if len(alignment_list) == 0:
     #    return(sorted(alignment_list))
 
+    if args.high_confidence and len(alignment_list) < 2:
+        return(sorted(alignment_list))
+    
     for primer_name, primer_seq in primers.primer_dict.items():
         if primer_name == 'T':
             continue
@@ -685,7 +688,7 @@ def processLamplicon(sw, generate_consensus_path, sam_to_bam_path, bam_to_pileup
     mut = 0
     wt = 0
     
-    alignments = findAllPrimerAlignments(sw, lamplicon.seq, primers, args.threshold)
+    alignments = findAllPrimerAlignments(sw, lamplicon.seq, primers, args.threshold, args)
     if len(alignments) > 0:
         # remove alignments that overlap by more than 4bp
         alignments = removeOverlappingPrimerAlignments(alignments, 4)
@@ -705,11 +708,15 @@ def processLamplicon(sw, generate_consensus_path, sam_to_bam_path, bam_to_pileup
         # track high quality ont sequences
         if alignment.primer_name.startswith('ont') and alignment.identity >= args.threshold:
             num_ont_seqs = num_ont_seqs + 1
-        
+
+    # if high confidence mode, only proceed if there are 2+ targets
+    if args.high_confidence and num_targets < 2:
+        return 0, 'unknown', 0, 0
+            
     # if there were no targets identified over the threshold
     # classify the read
-    if num_targets == 0:
-
+    if num_targets == 0:        
+        
         print("Didn't find any targets.... diagnosing...")
         
         # classify read as "ont" if it contains > 1 ONT sequence and fewer than 2 other suspected primer seqs and greater than 50% coverage
@@ -856,6 +863,10 @@ def processLamplicon(sw, generate_consensus_path, sam_to_bam_path, bam_to_pileup
           
     print("  - Pileup result: ",ref, depth, code_string, covers_roi)
 
+    # in high confidence mode, ignore pileups that have less than 2 entries
+    if args.high_confidence and depth < 2:
+        return 0, 'no_target', 0, 0
+    
     # if we don't cover the roi, then this was probably a spurious target sequence, classify as a "no_target"
     if not covers_roi:
         classification = 'no_target'
@@ -1137,8 +1148,9 @@ def main(args):
         output_handle.write(results_str)
             
     if args.save_concatemers:
-        with open("{}/{}_targets.fastq".format(args.output_dir, num_targets), "w") as output_handle:
-            SeqIO.write(target_read_list, output_handle, "fastq")
+        for num_targets, target_read_list in target_sequence_map.items():
+            with open("{}/{}_targets.fastq".format(args.output_dir, num_targets), "w") as output_handle:
+                SeqIO.write(target_read_list, output_handle, "fastq")
 
     
 
@@ -1158,6 +1170,7 @@ def argparser():
     parser.add_argument("--skip_consensus_polishing", action="store_true", default=False)
     parser.add_argument("--print_summary_stats", action="store_true", default=False)
     parser.add_argument("--save_concatemers", action="store_true", default=False)
+    parser.add_argument("--high_confidence", action="store_true", default=False)
     
     return parser
 
