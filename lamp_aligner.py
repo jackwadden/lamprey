@@ -34,16 +34,20 @@ class bcolors:
     UNDERLINE = '\033[4m'
 
 def print_blue(text):
+    sys.stdout.flush()
     sys.stdout.write(bcolors.BLUE + text + bcolors.ENDC)
 
 def print_cyan(text):
+    sys.stdout.flush()
     sys.stdout.write(bcolors.CYAN + text + bcolors.ENDC)
 
 def print_red(text):
+    sys.stdout.flush()
     sys.stdout.write(bcolors.FAIL + text + bcolors.ENDC)
 
 def print_green(text):
-    sys.stdout.write(bcolors.GREEN + text + bcolors.ENDC)
+    sys.stdout.flush()
+    sys.stdout.write(bcolors.GREEN + text + bcolors.ENDC + "\n")
     
 #########################
 class PrimerSet:
@@ -261,7 +265,7 @@ def findAllPrimerAlignments(aligner, seq, primers, identity_threshold):
     
 ###################
 def clearColor():
-    sys.stdout.write(u"\u001b[0m")
+    sys.stdout.write(bcolors.ENDC)
     
 def setPrimerColor(primer_string):
 
@@ -294,7 +298,7 @@ def printPrimerAlignments(seq, alignments):
     Fancy printing of all primers aligned to sequence.
     '''
 
-    print("")
+    print("", flush=True)
     print(seq)
     print(alignments)
 
@@ -377,6 +381,8 @@ def printPrimerAlignments(seq, alignments):
 ################################################
 def removeOverlappingPrimerAlignments(alignments, allowed_overlap):
 
+    print("* Removing overlapping primer alignments...")
+    
     new_alignments = list()
     overlapping_alignments = list()
 
@@ -395,7 +401,7 @@ def removeOverlappingPrimerAlignments(alignments, allowed_overlap):
         # if this alignment overlaps with the last alignment, pick a winner
         if alignment.start < last_alignment.end - allowed_overlap:
 
-            print(str(alignment.start) + " : " + str(alignment.end))
+            print("  - Found overlapping primer alignment: {}".format(str(alignment.start) + " : " + str(alignment.end)), flush=True)
 
             if alignment.identity > last_alignment.identity:
                 # erase last alignment without adding it
@@ -716,7 +722,7 @@ def processLamplicon(sw, generate_consensus_path, sam_to_bam_path, bam_to_pileup
             primer_coverage = 0
             for alignment in alignments:
                 primer_coverage = primer_coverage + (alignment.end - alignment.start)
-                print(primer_coverage)
+                print("Primer coverage: " + str(primer_coverage))
 
             alignment_coverage = float(primer_coverage)/float(seq_length)
             if alignment_coverage > 0.15:
@@ -772,13 +778,16 @@ def processLamplicon(sw, generate_consensus_path, sam_to_bam_path, bam_to_pileup
         else:
             # final default to unknown
             classification = 'unknown'
-        
+
+        # Return the final classification
         return num_targets, classification, mut, wt
 
+    ####################################
     # if we found a target....
     # extend each target into a single amplicon and emit as fasta
     target_idx = 0
     targets = []
+    alignment_intervals = list()
     for alignment in alignments:
 
         if alignment.primer_name == 'T' or alignment.primer_name == 'Tc':
@@ -791,7 +800,8 @@ def processLamplicon(sw, generate_consensus_path, sam_to_bam_path, bam_to_pileup
             if seq_end == -1:
                 seq_end = len(lamplicon.seq) - 1
 
-            print(str(seq_start) + " : " + str(seq_end))
+            
+            alignment_intervals.append(str(seq_start) + " : " + str(seq_end))
             
             # generate new read from lamplicon.seq substring
             record = SeqRecord(
@@ -803,13 +813,21 @@ def processLamplicon(sw, generate_consensus_path, sam_to_bam_path, bam_to_pileup
 
             targets.append(record)
             target_idx += 1
-        
+
+    # Print intervals
+    print("* Found {} candidate sub-reads:".format(len(alignment_intervals)))
+    for interval in alignment_intervals:
+        print("  " + interval)
+    print("", flush=True)
+          
     # write separated targets to new FASTA file
     fasta_fn = "{}/{}.fasta".format(args.output_dir, lamp_idx)
     with open(fasta_fn, "w") as output_handle:
         SeqIO.write(targets, output_handle, "fasta")
-        
+
+    
     # map each target sequence; ignore secondary mappings 
+    print("* Aligning candidate sub-reads...")
     out_sam_all = "{}/{}_all.sam".format(args.output_dir, lamp_idx)
     subprocess.run(["minimap2","-a","-xmap-ont","--eqx","-t 1","-w 1",
                     "-n 1", "-N 5", "--secondary=no", "-m 0","-p 0.6","-s 30", "-o{}".
@@ -835,8 +853,10 @@ def processLamplicon(sw, generate_consensus_path, sam_to_bam_path, bam_to_pileup
 
     for alt in vcf_record.ALT:
         variant = alt.value.upper()
-    
-    print("Pileup result: ",ref, depth, code_string, covers_roi)
+
+    print("  - Found {} reads that cover the target".format(depth))
+          
+    print("  - Pileup result: ",ref, depth, code_string, covers_roi)
 
     # if we don't cover the roi, then this was probably a spurious target sequence, classify as a "no_target"
     if not covers_roi:
@@ -846,7 +866,7 @@ def processLamplicon(sw, generate_consensus_path, sam_to_bam_path, bam_to_pileup
     # parse code string and set mut/wt counts
     wt, mut = parsePileupCodeString(code_string, variant)
 
-    print("Found {} mut and {} wt".format(mut,wt))
+    print("  - Found {} mut and {} wt calls".format(mut,wt))
             
     # num targets is now the actual depth from the pileup
     num_targets = depth
@@ -953,8 +973,10 @@ def main(args):
     # iterate over all lamplicon sequences
     print("> splitting and mapping lamplicons")
     target_records = list()
+    no_target_records = list()
     ont_records = list()
-    suspected_background_records = list()
+    background_records = list()
+    short_records = list()
     unknown_records = list()
 
     # histogram data structures
@@ -971,7 +993,9 @@ def main(args):
 
 
     # seed PRNG for VAF calcs
-    rng.seed(7)
+    simulate_vaf = False
+    if simulate_vaf:
+        rng.seed(7)
     
     mut_total = 0
     wt_total = 0
@@ -979,6 +1003,7 @@ def main(args):
     mut_reads = 0
     wt_reads = 0
 
+    target_lamplicon_counter = 0
 
     for lamp_idx,lamplicon in enumerate(lamplicons):
         
@@ -986,6 +1011,8 @@ def main(args):
         if args.max_lamplicons > 0 and lamp_idx >= args.max_lamplicons: break
         
         print_green("Processing Lamplicon {} \r".format(lamp_idx + 1))
+        #print("Processing Lamplicon {} \r".format(lamp_idx + 1))
+        sys.stdout.flush()
         
         num_targets,classification,mut,wt = processLamplicon(sw,
                                                              generate_consensus_path,
@@ -1000,68 +1027,80 @@ def main(args):
 
 
         # here, we can hijack the classification and inject our own VAF
-        target_vaf = 0.1
-        if classification == "target":
-            # roll the dice based on the VAF
-            # adjust mut/wt calls depending on the result of the dice
-            if rng.random() < target_vaf:
-                mut = mut + wt
-                wt = 0
-            else:
-                # IMPORTANT: don't do anything to preserve error in wt dataset
-                mut = mut
-                wt = wt
+        if simulate_vaf:
+            target_vaf = 0.1
+            if classification == "target":
+                # roll the dice based on the VAF
+                # adjust mut/wt calls depending on the result of the dice
+                if rng.random() < target_vaf:
+                    mut = mut + wt
+                    wt = 0
+                else:
+                    # IMPORTANT: don't do anything to preserve error in wt dataset
+                    mut = mut
+                    wt = wt
             
-        
-        # disaggregated totals (each target gets a vote)
-        mut_total = mut_total + mut
-        wt_total = wt_total + wt
+        if classification == "target":
 
-        # aggregated totals (each lamplicon gets a vote)
-        if mut > 0 and mut > wt:
-            mut_reads = mut_reads + 1
-        elif wt > 0 and wt >= mut:
-            wt_reads = wt_reads + 1
-        
-        print(class_counters)        
+            target_lamplicon_counter = target_lamplicon_counter + 1
+
+            # disaggregated totals (each target gets a vote)
+            mut_total = mut_total + mut
+            wt_total = wt_total + wt
+
+            # aggregated totals (each lamplicon gets a vote)
+            if mut > 0 and mut > wt:
+                mut_reads = mut_reads + 1
+            elif wt > 0 and wt >= mut:
+                wt_reads = wt_reads + 1
+
+        print("  - Classified as: " + classification)
         class_counters[classification] = class_counters[classification] + 1
-        print(classification)
+        sys.stdout.write("  ")
         print(class_counters)
 
         
         if (mut_total + wt_total) > 0:
-            print("Disagg VAF: {}/{} {}".format(mut_total, mut_total + wt_total, float(mut_total)/(float(mut_total)+float(wt_total))))
-            print("Aggreg VAF: {}/{} {}".format(mut_reads, mut_reads + wt_reads, float(mut_reads)/(float(mut_reads)+float(wt_reads))))
+            print("  - Disagg VAF: {}/{} {}".format(mut_total, mut_total + wt_total, float(mut_total)/(float(mut_total)+float(wt_total))))
+            print("  - Aggreg VAF: {}/{} {}".format(mut_reads, mut_reads + wt_reads, float(mut_reads)/(float(mut_reads)+float(wt_reads))))
 
+
+            print("* VAF Confidence Intervals: ")
+            sys.stdout.write("  ")
             proportionConfidenceInterval(mut_reads, wt_reads, 0.95)
+            sys.stdout.write("  ")
             proportionConfidenceInterval(mut_reads, wt_reads, 0.99)
+            sys.stdout.write("  ")
             proportionConfidenceInterval(mut_reads, wt_reads, 0.999)
+            sys.stdout.write("  ")
             proportionConfidenceInterval(mut_reads, wt_reads, 0.9999)
+            sys.stdout.flush()
 
-
-        #if classification == 'target':
-        #    target_records.append(lamplicon)
-        #elif classification == 'no_target':
-        #    no_target_records.append(lamplicon)
-        #elif classification == 'ont':
-        #    ont_records.append(lamplicon)
-        #elif classification == 'background':
-        #    background_records.append(lamplicon)
-        #elif classification == 'unknown':
-        #    unknown_records.append(lamplicon)
+        # Add record to list
+        if classification == 'target':
+            target_records.append(lamplicon)
+        elif classification == 'no_target':
+            no_target_records.append(lamplicon)
+        elif classification == 'ont':
+            ont_records.append(lamplicon)
+        elif classification == 'background':
+            background_records.append(lamplicon)
+        elif classification == 'short':
+            short_records.append(lamplicon)
+        elif classification == 'unknown':
+            unknown_records.append(lamplicon)
 
 
         # keep track of each sequence based on how many targets they have
-        if num_targets not in target_sequence_map.keys():
-            target_sequence_map[num_targets] = list()
+        if classification == "target":
+            if num_targets not in target_sequence_map.keys():
+                target_sequence_map[num_targets] = list()
 
-        target_sequence_map[num_targets].append(lamplicon)
-
-
+            target_sequence_map[num_targets].append(lamplicon)
         
         # sort the target count histogram
         target_sequence_map = collections.OrderedDict(sorted(target_sequence_map.items()))
-
+        print("")
         
     print("")
 
@@ -1080,7 +1119,7 @@ def main(args):
     
     # print summary stats
     if args.print_summary_stats:
-        total_records = len(target_records) + len(ont_records) + len(unknown_records)
+        total_records = len(target_records) + len(no_target_records) + len(ont_records) + len(background_records) + len(short_records) + len(unknown_records)
         results_str = ''
         results_str = results_str + "> SUMMARY Statistics:\n"
         results_str = results_str + "> Examined {} lamplicons\n".format(total_records)
