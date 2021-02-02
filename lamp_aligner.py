@@ -5,7 +5,7 @@ import sys, os, subprocess, argparse, collections
 import random as rng
 
 # use local swalign?
-sys.path.insert(0, '/home/dna/software/swalign')
+sys.path.insert(0, '/home/dna/software/cswalign')
 import swalign
 
 import mappy
@@ -251,7 +251,7 @@ def findAllPrimerAlignments(aligner, seq, primers, identity_threshold, args):
     #    return(sorted(alignment_list))
 
     if args.high_confidence and len(alignment_list) < 2:
-        return(sorted(alignment_list))
+        return(sorted(alignment_list), 0.0)
     
     for primer_name, primer_seq in primers.primer_dict.items():
         if primer_name == 'T':
@@ -261,8 +261,20 @@ def findAllPrimerAlignments(aligner, seq, primers, identity_threshold, args):
             alignment_list.extend(findPrimerAlignments(aligner, seq, primer_seq, primer_name, identity_threshold))
             # rc
             alignment_list.extend(findPrimerAlignments(aligner, seq, rc(primer_seq), primer_name + "c", identity_threshold))
-    
-    return(sorted(alignment_list))
+
+
+    alignment_list = sorted(alignment_list)
+            
+    # get alignment coverage
+    seq_length = len(seq)
+    primer_coverage = 0
+    for alignment in alignment_list:
+        primer_coverage = primer_coverage + (alignment.end - alignment.start)
+        #print("Primer coverage: " + str(primer_coverage))
+
+    alignment_coverage = float(primer_coverage)/float(seq_length)
+     
+    return(alignment_list, alignment_coverage)
     
 ###################
 def clearColor():
@@ -626,23 +638,30 @@ def parsePileupCodeString(code_string, variant):
                           
 
 ################################################
-def extractPileupInfo(pileup_fn, contig, locus):
+def extractPileupInfo(pileup_fn, contig, target_locus, limit):
     # parse lines in the pileup, extract the depth at the locus
 
     ref = ''
     depth = 0
     code_string = ''
     covers_roi = False
+    within_roi = False
     with open(pileup_fn) as fp:
         for line in fp:
             fields = line.split('\t')
-            if fields[0] == contig and int(fields[1]) == locus:
-                ref = fields[2]
-                depth = int(fields[3])
-                code_string = fields[4]
-                covers_roi = True
+            if fields[0] == contig:
+
+                pileup_locus = int(fields[1])
                 
-    return ref, depth, code_string, covers_roi
+                if pileup_locus == target_locus:
+                    ref = fields[2]
+                    depth = int(fields[3])
+                    code_string = fields[4]
+                    covers_roi = True
+                elif pileup_locus < (target_locus + limit) and pileup_locus > (target_locus - limit):
+                    within_roi = True
+                
+    return ref, depth, code_string, covers_roi, within_roi
 
 ################################################
 def generatePileup(bam_to_pileup_sh, ref_fn, bam_fn, out_fn):
@@ -678,17 +697,36 @@ def parseVCF(vcf_fn):
 
     return
     
+################################################
+def is_hit_near_target(alignment, vcf_record, limit):
+    contig = alignment.ctg
+    ref_start = alignment.r_st
+    ref_end = alignment.r_en
+
+    target_contig = vcf_record.CHROM
+    target_locus = vcf_record.POS
+
+    if target_contig == contig:
+        # fully contained to be considered a fragment
+        if target_locus + limit > ref_end and target_locus - limit < ref_start:
+            return True
+
+    return False
 
 
 ################################################
-def processLamplicon(sw, generate_consensus_path, sam_to_bam_path, bam_to_pileup_path, minimap2, lamp_idx, lamplicon, primers, vcf_record, args):
+def processLamplicon(sw, generate_consensus_path, sam_to_bam_path, bam_to_pileup_path, minimap2, lamp_idx, lamplicon, primers, ref_vcf_record, target_vcf_record, args):
 
+
+    # fragment limit
+    # the distance between the locus and th start or end of the alignment to be considered a fragment
+    fragment_limit = 1000
 
     # track how many votes each has
     mut = 0
     wt = 0
     
-    alignments = findAllPrimerAlignments(sw, lamplicon.seq, primers, args.threshold, args)
+    alignments, alignment_coverage = findAllPrimerAlignments(sw, lamplicon.seq, primers, args.threshold, args)
     if len(alignments) > 0:
         # remove alignments that overlap by more than 4bp
         alignments = removeOverlappingPrimerAlignments(alignments, 4)
@@ -697,7 +735,6 @@ def processLamplicon(sw, generate_consensus_path, sam_to_bam_path, bam_to_pileup
     if args.debug_print:
         printPrimerAlignments(lamplicon.seq, alignments)
 
-            
     # does this lamplicon possibly cover the target?
     num_targets = 0
     num_ont_seqs = 0
@@ -712,25 +749,58 @@ def processLamplicon(sw, generate_consensus_path, sam_to_bam_path, bam_to_pileup
     # if high confidence mode, only proceed if there are 2+ targets
     if args.high_confidence and num_targets < 2:
         return 0, 'unknown', 0, 0
+
+    # low alignment coverage indicates this may be a genomic read
+    if alignment_coverage < 0.15:
+        print("* Low alignment coverage. Suspected genomic read. Aligning to human ref...")
+        for hit in minimap2.map(lamplicon.seq):
+            print(hit)
             
+            # skip non-primary alignments
+            if not hit.is_primary:
+                continue
+            
+            # if the hit is within fragment_limit of the target, mark it as a fragment
+            if not is_hit_near_target(hit, ref_vcf_record, fragment_limit):
+                print("  - Alignment not near reference target. Assuming background genomic read.")
+                classification = 'background'                
+                return num_targets, classification, mut, wt
+
+        print("  - Could not confirm genomic read, diagnosing further...")
+                
     # if there were no targets identified over the threshold
     # classify the read
     if num_targets == 0:        
         
-        print("Didn't find any targets.... diagnosing...")
+        print("* Didn't find any targets.... diagnosing...")
+
+        # this is maybe a background genomic read or a lamplicon "fragment"
+        # fragments occur due to fragmentation-based library prep or shearing
+        # try to align the read to see if it's a background genomic read
+        # if we have any hits, classify as background
+        for hit in minimap2.map(lamplicon.seq):
+
+            print(hit)
+            
+            # skip non-primary alignments
+            if not hit.is_primary:
+                continue
+            
+            # if the hit is within fragment_limit of the target, mark it as a fragment
+            if is_hit_near_target(hit, ref_vcf_record, fragment_limit):
+                classification = 'fragment'
+                return num_targets, classification, mut, wt
+            
+            # else, just mark it as background
+            classification = 'background'
+            return num_targets, classification, mut, wt
+
         
         # classify read as "ont" if it contains > 1 ONT sequence and fewer than 2 other suspected primer seqs and greater than 50% coverage
         if num_ont_seqs > 0 and (len(alignments) - 2) <= num_ont_seqs :
 
-            # get alignment coverage
-            seq_length = len(lamplicon.seq)
-            primer_coverage = 0
-            for alignment in alignments:
-                primer_coverage = primer_coverage + (alignment.end - alignment.start)
-                print("Primer coverage: " + str(primer_coverage))
-
-            alignment_coverage = float(primer_coverage)/float(seq_length)
-            if alignment_coverage > 0.15:
+            # get coverage
+            if alignment_coverage >= 0.15:
                 classification = 'ont'
             else:
                 # assume unknown
@@ -743,17 +813,11 @@ def processLamplicon(sw, generate_consensus_path, sam_to_bam_path, bam_to_pileup
             return num_targets, classification, mut, wt
                     
             
-        # classify the read as no_target (bad/erroneous primer amplification) if it has at least 3 primer sequences but no target
+        # classify the read as spurious (bad/erroneous primer amplification) if it has at least 3 primer sequences, didn't align at the locus, and no target
         if len(alignments) >= 3:
-            classification = 'no_target'
+            classification = 'spurious'
             return num_targets, classification, mut, wt
 
-        # this is maybe a background genomic read
-        # try to align the read to see if it's a background genomic read
-        # if we have any hits, classify as background
-        for hit in minimap2.map(lamplicon.seq):
-            classification = 'background'
-            return num_targets, classification, mut, wt
         
         # if there aren't any ont sequences or target/lamp sequences, then let's try to align this read to the human genome
         # write separated targets to new FASTA file
@@ -789,6 +853,7 @@ def processLamplicon(sw, generate_consensus_path, sam_to_bam_path, bam_to_pileup
 
     ####################################
     # if we found a target....
+
     # extend each target into a single amplicon and emit as fasta
     target_idx = 0
     targets = []
@@ -830,8 +895,11 @@ def processLamplicon(sw, generate_consensus_path, sam_to_bam_path, bam_to_pileup
     with open(fasta_fn, "w") as output_handle:
         SeqIO.write(targets, output_handle, "fasta")
 
-    
-    # map each target sequence; ignore secondary mappings 
+
+    ##################################################################
+    #  STAGE 2: Map each sub-read against a smaller target reference #
+    ##################################################################
+    # map each sub read to the target sequence; ignore secondary mappings 
     print("* Aligning candidate sub-reads...")
     out_sam_all = "{}/{}_all.sam".format(args.output_dir, lamp_idx)
     subprocess.run(["minimap2","-a","-xmap-ont","--eqx","-t 1","-w 1",
@@ -854,9 +922,10 @@ def processLamplicon(sw, generate_consensus_path, sam_to_bam_path, bam_to_pileup
     pileup_fn = "{}/{}.pileup".format(args.output_dir, lamp_idx)
         
     # extract pileup info
-    ref, depth, code_string, covers_roi = extractPileupInfo(pileup_fn, vcf_record.CHROM, vcf_record.POS)
+    limit = 1000
+    ref, depth, code_string, covers_roi, within_roi = extractPileupInfo(pileup_fn, target_vcf_record.CHROM, target_vcf_record.POS, limit)
 
-    for alt in vcf_record.ALT:
+    for alt in target_vcf_record.ALT:
         variant = alt.value.upper()
 
     print("  - Found {} reads that cover the target".format(depth))
@@ -865,13 +934,16 @@ def processLamplicon(sw, generate_consensus_path, sam_to_bam_path, bam_to_pileup
 
     # in high confidence mode, ignore pileups that have less than 2 entries
     if args.high_confidence and depth < 2:
-        return 0, 'no_target', 0, 0
+        return 0, 'unknown', 0, 0
     
-    # if we don't cover the roi, then this was probably a spurious target sequence, classify as a "no_target"
+    # if we don't cover the roi, then this was probably a fragment, off target, or spurious
     if not covers_roi:
-        classification = 'no_target'
+        if within_roi:
+            classification = 'fragment'
+        else:
+            classification = 'spurious'
         return num_targets, classification, mut, wt
-    
+        
     # parse code string and set mut/wt counts
     wt, mut = parsePileupCodeString(code_string, variant)
 
@@ -933,13 +1005,20 @@ def processLamplicon(sw, generate_consensus_path, sam_to_bam_path, bam_to_pileup
         
         # return whether or not this sequence had a target
 
+    # if we don't have any targets after splitting, and aligning
     if num_targets == 0:
+
+        print("WHY!?!?!")
+        exit(1)
+
         if len(alignments) >= 2:
-            classification = 'no_target'
+            classification = 'spurious'
         elif len(lamplicon.seq) < 60:
             classification = 'short'
         else:
             classification = 'unknown'
+
+    # if we do cover the roi and have at least one target, we are  target read
     else:
         classification = 'target'
 
@@ -964,9 +1043,13 @@ def main(args):
     print("> parsing primers")
     primers = PrimerSet(args.primer_set_fn)
 
+    # parse ref VCF file if there is one
+    if args.ref_vcf_fn != '':
+        ref_vcf_record = parseVCF(args.ref_vcf_fn)
+
     # parse VCF file if there is one
-    if args.vcf_fn != '':
-        vcf_record = parseVCF(args.vcf_fn)
+    if args.target_vcf_fn != '':
+        target_vcf_record = parseVCF(args.target_vcf_fn)
     
     # initialize aligner
     print("> initializing aligners")
@@ -982,7 +1065,8 @@ def main(args):
     # iterate over all lamplicon sequences
     print("> splitting and mapping lamplicons")
     target_records = list()
-    no_target_records = list()
+    fragment_records = list()
+    spurious_records = list()
     ont_records = list()
     background_records = list()
     short_records = list()
@@ -994,7 +1078,8 @@ def main(args):
     # process each record
     class_counters = dict()
     class_counters['target'] = 0
-    class_counters['no_target'] = 0
+    class_counters['fragment'] = 0
+    class_counters['spurious'] = 0
     class_counters['ont'] = 0
     class_counters['background'] = 0
     class_counters['short'] = 0
@@ -1031,7 +1116,8 @@ def main(args):
                                                              lamp_idx,
                                                              lamplicon,
                                                              primers,
-                                                             vcf_record,
+                                                             ref_vcf_record,
+                                                             target_vcf_record,
                                                              args);
 
 
@@ -1088,8 +1174,10 @@ def main(args):
         # Add record to list
         if classification == 'target':
             target_records.append(lamplicon)
-        elif classification == 'no_target':
-            no_target_records.append(lamplicon)
+        elif classification == 'fragment':
+            fragment_records.append(lamplicon)
+        elif classification == 'spurious':
+            spurious_records.append(lamplicon)
         elif classification == 'ont':
             ont_records.append(lamplicon)
         elif classification == 'background':
@@ -1128,7 +1216,7 @@ def main(args):
     
     # print summary stats
     if args.print_summary_stats:
-        total_records = len(target_records) + len(no_target_records) + len(ont_records) + len(background_records) + len(short_records) + len(unknown_records)
+        total_records = len(target_records) + len(fragment_records) + len(spurious_records) + len(ont_records) + len(background_records) + len(short_records) + len(unknown_records)
         results_str = ''
         results_str = results_str + "> SUMMARY Statistics:\n"
         results_str = results_str + "> Examined {} lamplicons\n".format(total_records)
@@ -1161,7 +1249,8 @@ def argparser():
     parser.add_argument("primer_set_fn")
     parser.add_argument("lamplicons_fn")
     parser.add_argument("--output_dir", type=str, default="results")
-    parser.add_argument("--vcf_fn", type=str, default='')
+    parser.add_argument("--target_vcf_fn", type=str, default='')
+    parser.add_argument("--ref_vcf_fn", type=str, default='')
     parser.add_argument("--max_lamplicons", type=int, default=-1)
     parser.add_argument("--threshold", type=float, default=0.80,
             help="Primer identity threshold for successful alignment")
