@@ -13,6 +13,7 @@ import pysam
 import vcfpy
 import numpy as np
 import statsmodels.api as sm
+import datetime
 
 from Bio import SeqIO
 from Bio.SeqRecord import SeqRecord
@@ -32,19 +33,15 @@ class bcolors:
     UNDERLINE = '\033[4m'
 
 def print_blue(text):
-    sys.stdout.flush()
     sys.stdout.write(bcolors.BLUE + text + bcolors.ENDC)
 
 def print_cyan(text):
-    sys.stdout.flush()
     sys.stdout.write(bcolors.CYAN + text + bcolors.ENDC)
 
 def print_red(text):
-    sys.stdout.flush()
     sys.stdout.write(bcolors.FAIL + text + bcolors.ENDC)
 
 def print_green(text):
-    sys.stdout.flush()
     sys.stdout.write(bcolors.GREEN + text + bcolors.ENDC + "\n")
     
 #########################
@@ -684,7 +681,10 @@ def proportionConfidenceInterval(mut, wt, conf):
     high = conf_int[1] * 100.0 - samp_mean
 
     #print("conf:", conf, "%.2f" % low, " -- ", "%.2f" % samp_mean, " -- ", "%.2f" % high, ")")
-    print("conf:", conf, "%.4f" % (conf_int[0]*100.0), " -- ", "%.2f" % samp_mean, " -- ", "%.4f" % (conf_int[1]*100.0), ")")
+    #print("conf:", conf, "%.4f" % (conf_int[0]*100.0), " -- ", "%.2f" % samp_mean, " -- ", "%.4f" % (conf_int[1]*100.0), ")")
+
+    return conf_int[0], samp_mean, conf_int[1]
+
     
 ################################################
 def parseVCF(vcf_fn):
@@ -713,6 +713,15 @@ def is_hit_near_target(alignment, vcf_record, limit):
 
     return False
 
+######################################
+def parseTimestamp(timestamp):
+    # format: 2019-07-10T20:53:45Z
+    parsed_time = datetime.datetime.strptime(timestamp, "%Y-%m-%dT%H:%M:%SZ")
+    return parsed_time
+
+def timestampDelta(start, end):
+    delta = end - start
+    return delta.total_seconds()
 
 ################################################
 def processLamplicon(sw, process_candidates_path, generate_consensus_path, minimap2, lamp_idx, lamplicon, primers, ref_vcf_record, target_vcf_record, args):
@@ -885,7 +894,7 @@ def processLamplicon(sw, process_candidates_path, generate_consensus_path, minim
             target_idx += 1
 
     # Print intervals
-    print("* Found {} candidate sub-reads:".format(len(alignment_intervals)))
+    print("* Found {} candidate sub-reads at intervals:".format(len(alignment_intervals)))
     for interval in alignment_intervals:
         print("  " + interval)
     print("", flush=True)
@@ -959,7 +968,18 @@ def processLamplicon(sw, process_candidates_path, generate_consensus_path, minim
         classification = 'target'
 
     return num_targets, classification, mut, wt
-        
+
+def initAligners(args):
+    match = 2
+    mismatch = -1
+    scoring = swalign.NucleotideScoringMatrix(match, mismatch)
+    sw = swalign.LocalAlignment(scoring)  # you can also choose gap penalties, etc...
+
+    # set up a mappy instance to align reads
+    minimap2 = mappy.Aligner(args.human_ref_fn)  # load or build index
+    if not minimap2: raise Exception("ERROR: failed to load/build index")
+
+    return sw, minimap2
         
 def main(args):
 
@@ -988,14 +1008,7 @@ def main(args):
     
     # initialize aligner
     print("> initializing aligners")
-    match = 2
-    mismatch = -1
-    scoring = swalign.NucleotideScoringMatrix(match, mismatch)
-    sw = swalign.LocalAlignment(scoring)  # you can also choose gap penalties, etc...
-
-    # set up a mappy instance to align reads
-    minimap2 = mappy.Aligner(args.human_ref_fn)  # load or build index
-    if not minimap2: raise Exception("ERROR: failed to load/build index")
+    sw, minimap2 = initAligners(args)
     
     # iterate over all lamplicon sequences
     print("> splitting and mapping lamplicons")
@@ -1006,7 +1019,8 @@ def main(args):
     background_records = list()
     short_records = list()
     unknown_records = list()
-
+    VAF_over_time = list()
+    
     # histogram data structures
     target_sequence_map = dict()
     
@@ -1034,14 +1048,22 @@ def main(args):
 
     target_lamplicon_counter = 0
 
+    start_time = 0.0
+    
     for lamp_idx,lamplicon in enumerate(lamplicons):
         
         # print status, stop early if we've found enough
         if args.max_lamplicons > 0 and lamp_idx >= args.max_lamplicons: break
         
         print_green("Processing Lamplicon {} \r".format(lamp_idx + 1))
-        #print("Processing Lamplicon {} \r".format(lamp_idx + 1))
-        sys.stdout.flush()
+        print_green(lamplicon.description.split()[5])
+
+        timestamp = parseTimestamp(lamplicon.description.split()[5].split('=')[1])
+
+        if lamp_idx == 0:
+            start_time = timestamp
+        
+        timestamp_seconds =timestampDelta(start_time, timestamp)
         
         num_targets,classification,mut,wt = processLamplicon(sw,
                                                              process_candidates_path,
@@ -1078,9 +1100,11 @@ def main(args):
             wt_total = wt_total + wt
 
             # aggregated totals (each lamplicon gets a vote)
-            if mut > 0 and mut > wt:
+            # consensus calling goes here
+            # calls must have majority (>50%)
+            if float(mut)/float(num_targets) > 0.5:
                 mut_reads = mut_reads + 1
-            elif wt > 0 and wt >= mut:
+            elif float(wt)/float(num_targets) > 0.5:
                 wt_reads = wt_reads + 1
 
         print("  - Classified as: " + classification)
@@ -1088,22 +1112,36 @@ def main(args):
         sys.stdout.write("  ")
         print(class_counters)
 
+
+        ### Track VAF over time
+        VAF_over_time.append((timestamp_seconds, mut_reads, wt_reads))
         
         if (mut_total + wt_total) > 0:
             print("  - Disagg VAF: {}/{} {}".format(mut_total, mut_total + wt_total, float(mut_total)/(float(mut_total)+float(wt_total))))
             print("  - Aggreg VAF: {}/{} {}".format(mut_reads, mut_reads + wt_reads, float(mut_reads)/(float(mut_reads)+float(wt_reads))))
 
 
+            error_rate = 0.015
+            
             print("* VAF Confidence Intervals: ")
             sys.stdout.write("  ")
-            proportionConfidenceInterval(mut_reads, wt_reads, 0.95)
+            conf = 0.999
+            error_low, error_mean, error_high = proportionConfidenceInterval(error_rate * (mut_reads+wt_reads), (1.0 - error_rate) * (mut_reads+wt_reads), conf)
+            variant_low, variant_mean, variant_high = proportionConfidenceInterval(mut_reads, wt_reads, conf)
+            result_str = "conf: {} {:.4f} -- {:.2f} -- {:.4f}".format(conf, variant_low*100.0, variant_mean, variant_high*100.0)
+
+            # print in green if call is statistically significant above ONT error rate
+            if error_high < variant_low:
+                print_green(result_str)
+            else:
+                print(result_str)
+
             sys.stdout.write("  ")
             proportionConfidenceInterval(mut_reads, wt_reads, 0.99)
             sys.stdout.write("  ")
             proportionConfidenceInterval(mut_reads, wt_reads, 0.999)
             sys.stdout.write("  ")
             proportionConfidenceInterval(mut_reads, wt_reads, 0.9999)
-            sys.stdout.flush()
 
         # Add record to list
         if classification == 'target':
@@ -1168,13 +1206,16 @@ def main(args):
     # write stats to output file
     with open("{}/summary_stats.txt".format(args.output_dir), "w") as output_handle:
         output_handle.write(results_str)
-            
+
+    # write groups of concatemer lengths to different files
     if args.save_concatemers:
         for num_targets, target_read_list in target_sequence_map.items():
             with open("{}/{}_targets.fastq".format(args.output_dir, num_targets), "w") as output_handle:
                 SeqIO.write(target_read_list, output_handle, "fastq")
 
-    
+    # write VAF over time entries to file
+    with open("{}/VAF_over_time.txt".format(args.output_dir), 'w') as fp:
+            fp.write('\n'.join("{} {} {}".format(x[0], x[1], x[2]) for x in VAF_over_time))
 
 def argparser():
     parser = argparse.ArgumentParser()
@@ -1202,15 +1243,5 @@ def argparser():
 if __name__ == "__main__":
     parser = argparser()
     args = parser.parse_args()
-
-    
-    #import cProfile, pstats
-    #profiler = cProfile.Profile()
-    #profiler.enable()
-
     main(args)
 
-    #profiler.disable()
-    #stats = pstats.Stats(profiler).sort_stats('tottime')
-    #stats.print_stats()
-    #stats.dump_stats('profile.dat')
