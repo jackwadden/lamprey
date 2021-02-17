@@ -148,7 +148,21 @@ class Result:
 
     def __lt__(self, other):
         return self.timestamp < other.timestamp
-        
+
+##########################
+def printHeader():
+    s = ''
+    s += '    __    ___    __  _______\n'
+    s += '   / /   /   |  /  |/  / __ \________  __  __\n'
+    s += '  / /   / /| | / /|_/ / /_/ / ___/ _ \/ / / /\n'
+    s += ' / /___/ ___ |/ /  / / ____/ /  /  __/ /_/ /\n'
+    s += '/_____/_/  |_/_/  /_/_/   /_/   \___/\__, /\n'
+    s += '                                    /____/   \n'
+    s += ' by Jack Wadden\n'
+    s += ' Version 0.1\n'
+    
+    print(s)
+    
 #######
 def alignPrimer(aligner, seq, primer, primer_name):
     '''
@@ -1012,59 +1026,13 @@ def processLamplicons(args, primers, ref_vcf_record, target_vcf_record, lamplico
         print("> initializing aligners")
     sw, minimap2 = initAligners(args)
     
-    target_records = list()
-    fragment_records = list()
-    spurious_records = list()
-    ont_records = list()
-    background_records = list()
-    short_records = list()
-    unknown_records = list()
-    VAF_over_time = list()
-    
-    # histogram data structures
-    target_sequence_map = dict()
-    
-    # process each record
-    class_counters = dict()
-    class_counters['target'] = 0
-    class_counters['fragment'] = 0
-    class_counters['spurious'] = 0
-    class_counters['ont'] = 0
-    class_counters['background'] = 0
-    class_counters['short'] = 0
-    class_counters['unknown'] = 0
-
-
-    # seed PRNG for VAF calcs
-    simulate_vaf = False
-    if simulate_vaf:
-        rng.seed(7)
-    
-    mut_total = 0
-    wt_total = 0
-
-    mut_reads = 0
-    wt_reads = 0
-
-    target_lamplicon_counter = 0
-
-    start_time = 0.0
-
     results = []
     
     for lamp_idx,lamplicon in lamplicon_batch:
         
-        # print status, stop early if we've found enough
-        if args.max_lamplicons > 0 and lamp_idx >= args.max_lamplicons: break
-        
         #print_green("Processing Lamplicon {} \r".format(lamp_idx + 1))
 
         timestamp = parseTimestamp(lamplicon.description.split()[5].split('=')[1])
-
-        if lamp_idx == lamplicon_batch[0][0]:
-            start_time = timestamp
-        
-        timestamp_seconds =timestampDelta(start_time, timestamp)
         
         result = processLamplicon(sw,
                                   process_candidates_path,
@@ -1076,17 +1044,6 @@ def processLamplicons(args, primers, ref_vcf_record, target_vcf_record, lamplico
                                   ref_vcf_record,
                                   target_vcf_record,
                                   args);
-
-        # here, we can hijack the classification and inject our own VAF
-        if simulate_vaf:
-            target_vaf = 0.1
-            if result.classification == "target":
-                # roll the dice based on the VAF
-                # adjust mut/wt calls depending on the result of the dice
-                if rng.random() < target_vaf:
-                    result.mut_count = result.mut_count + result.wt_count
-                    result.wt_count = 0
-                
 
         # add to list of results
         result.id = lamp_idx
@@ -1104,9 +1061,12 @@ def runProcess(thread_id, q, args, primers, rev_vcf_record, target_vcf_record, l
 
 def main(args):
 
+    # print header
+    printHeader()
+    
     # load and parse files
     # parse all lamplicons from FASTQ file
-    print("> parsing lamplicons")
+    print("> Parsing lamplicon file: {}".format(args.lamplicons_fn))
     #lamplicon_seqs = [l.seq for l in SeqIO.parse(args.lamplicons_fn, "fastq")]
     raw_lamplicons = SeqIO.parse(args.lamplicons_fn, "fastq")
 
@@ -1116,17 +1076,22 @@ def main(args):
     for lamplicon in raw_lamplicons:
         lamplicons.append((id_counter, lamplicon))
         id_counter = id_counter + 1
-    
+
+    print("  * found {} reads.".format(len(lamplicons)))
+        
     # parse primers from config file
-    print("> parsing primers")
+    print("> Parsing LAMP assay schema file: {}".format(args.primer_set_fn))
     primers = PrimerSet(args.primer_set_fn)
 
+    print("> Parsing target mutation VCF files:")
     # parse ref VCF file if there is one
     if args.ref_vcf_fn != '':
+        print("  * {}".format(args.ref_vcf_fn))
         ref_vcf_record = parseVCF(args.ref_vcf_fn)
 
     # parse VCF file if there is one
     if args.target_vcf_fn != '':
+        print("  * {}".format(args.target_vcf_fn))
         target_vcf_record = parseVCF(args.target_vcf_fn)
     
 
@@ -1144,7 +1109,7 @@ def main(args):
         lamplicon_batch[i % num_processes].append(lamplicons[i])
 
     # allocate processes
-    print("> Launching {} processes and initializing aligners...".format(num_processes))
+    print("> Launching {} processes, initializing aligners, and processing reads...".format(num_processes))
     for i in range(num_processes):
         processes.append(multiprocessing.Process(target = runProcess, args = (i, q, args, primers, ref_vcf_record, target_vcf_record, lamplicon_batch[i])))
 
@@ -1161,11 +1126,28 @@ def main(args):
     for i in range(num_processes):
         processes[i].join()
 
+    print(" * Finished processing all reads.")
+        
     # process results
-    print("DONE!")
-    #for result in results:
-    #    print(result.timestamp, result.classification)
-    #    printPrimerAlignments(result.seq.seq, result.alignments)
+    target_counter = 0
+    mut_count = 0
+    wt_count = 0
+    for result in results:
+
+        if result.classification == 'target':
+            target_counter = target_counter + 1
+
+        if result.target_depth > 0:
+            if float(result.mut_count)/float(result.target_depth):
+                mut_count = mut_count + 1
+
+            if float(result.wt_count)/float(result.target_depth):
+                wt_count = wt_count + 1
+
+    # print results
+    print("\nResult Summary:")
+    print(" Target Fraction: {:.2f}%".format(float(target_counter)/float(len(lamplicons)) * 100.0))
+    print(" VAF: {:.2f}%".format(float(mut_count)/float(mut_count + wt_count) * 100.0))
         
 def argparser():
     parser = argparse.ArgumentParser()
