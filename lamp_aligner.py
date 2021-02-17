@@ -1,6 +1,10 @@
 #!/usr/bin/python
 
 import sys, os, subprocess, argparse, collections
+import heapq
+import time
+import multiprocessing
+from progressbar import progressbar
 
 import random as rng
 
@@ -123,7 +127,28 @@ class Alignment:
     
     def __eq__(self, other):
         self.start == other.start
-    
+
+
+#########################
+class Result:
+    '''
+    Stores lamplicon classification, pileup info, and other post processing information.
+    '''
+
+    def __init__(self, classification='unknown', mut_count=0, wt_count=0, pileup_str='', target_depth=0, alignments=[], seq=None, id=0, timestamp=None):
+        self.classification = classification
+        self.mut_count = mut_count
+        self.wt_count = wt_count
+        self.pileup_str = pileup_str
+        self.target_depth = target_depth
+        self.alignments = alignments
+        self.seq = seq
+        self.id = id
+        self.timestamp = timestamp
+
+    def __lt__(self, other):
+        return self.timestamp < other.timestamp
+        
 #######
 def alignPrimer(aligner, seq, primer, primer_name):
     '''
@@ -389,9 +414,10 @@ def printPrimerAlignments(seq, alignments):
     sys.stdout.write('\n')
 
 ################################################
-def removeOverlappingPrimerAlignments(alignments, allowed_overlap):
+def removeOverlappingPrimerAlignments(debug_print, alignments, allowed_overlap):
 
-    print("* Removing overlapping primer alignments...")
+    if debug_print:
+        print("* Removing overlapping primer alignments...")
     
     new_alignments = list()
     overlapping_alignments = list()
@@ -411,7 +437,8 @@ def removeOverlappingPrimerAlignments(alignments, allowed_overlap):
         # if this alignment overlaps with the last alignment, pick a winner
         if alignment.start < last_alignment.end - allowed_overlap:
 
-            print("  - Found overlapping primer alignment: {}".format(str(alignment.start) + " : " + str(alignment.end)), flush=True)
+            if debug_print:
+                print("  - Found overlapping primer alignment: {}".format(str(alignment.start) + " : " + str(alignment.end)), flush=True)
 
             if alignment.identity > last_alignment.identity:
                 # erase last alignment without adding it
@@ -726,20 +753,20 @@ def timestampDelta(start, end):
 ################################################
 def processLamplicon(sw, process_candidates_path, generate_consensus_path, minimap2, lamp_idx, lamplicon, primers, ref_vcf_record, target_vcf_record, args):
 
+    result = Result(seq=lamplicon)
 
     # fragment limit
     # the distance between the locus and th start or end of the alignment to be considered a fragment
     fragment_limit = 1000
 
-    # track how many votes each has
-    mut = 0
-    wt = 0
-    
     alignments, alignment_coverage = findAllPrimerAlignments(sw, lamplicon.seq, primers, args.threshold, args)
     if len(alignments) > 0:
         # remove alignments that overlap by more than 4bp
-        alignments = removeOverlappingPrimerAlignments(alignments, 4)
+        alignments = removeOverlappingPrimerAlignments(args.debug_print, alignments, 4)
 
+    # save alignments
+    result.alignments = alignments
+        
     # optionally print alignments of all primers
     if args.debug_print:
         printPrimerAlignments(lamplicon.seq, alignments)
@@ -747,9 +774,10 @@ def processLamplicon(sw, process_candidates_path, generate_consensus_path, minim
     # does this lamplicon possibly cover the target?
     num_targets = 0
     num_ont_seqs = 0
+
     for alignment in alignments:
         if alignment.primer_name in ['T', 'Tc']:
-            num_targets = num_targets + 1
+            result.target_depth = result.target_depth + 1
 
         # track high quality ont sequences
         if alignment.primer_name.startswith('ont') and alignment.identity >= args.threshold:
@@ -757,13 +785,15 @@ def processLamplicon(sw, process_candidates_path, generate_consensus_path, minim
 
     # if high confidence mode, only proceed if there are 2+ targets
     if args.high_confidence and num_targets < 2:
-        return 0, 'unknown', 0, 0
+        return Result(target_depth=0, classification='unknown', mut_count=0, wt_count=0, pileup_str='')
 
     # low alignment coverage indicates this may be a genomic read
     if alignment_coverage < 0.15:
-        print("* Low alignment coverage. Suspected genomic read. Aligning to human ref...")
+        if args.debug_print:
+            print("* Low alignment coverage. Suspected genomic read. Aligning to human ref...")
         for hit in minimap2.map(lamplicon.seq):
-            print(hit)
+            if args.debug_print:
+                print(hit)
             
             # skip non-primary alignments
             if not hit.is_primary:
@@ -771,17 +801,20 @@ def processLamplicon(sw, process_candidates_path, generate_consensus_path, minim
             
             # if the hit is within fragment_limit of the target, mark it as a fragment
             if not is_hit_near_target(hit, ref_vcf_record, fragment_limit):
-                print("  - Alignment not near reference target. Assuming background genomic read.")
-                classification = 'background'                
-                return num_targets, classification, mut, wt
+                if args.debug_print:
+                    print("  - Alignment not near reference target. Assuming background genomic read.")
+                result.classification = 'background'
+                return result
 
-        print("  - Could not confirm genomic read, diagnosing further...")
+        if args.debug_print:
+            print("  - Could not confirm genomic read, diagnosing further...")
                 
     # if there were no targets identified over the threshold
     # classify the read
-    if num_targets == 0:        
-        
-        print("* Didn't find any targets.... diagnosing...")
+    if result.target_depth == 0:        
+
+        if args.debug_print:
+            print("* Didn't find any targets.... diagnosing...")
 
         # this is maybe a background genomic read or a lamplicon "fragment"
         # fragments occur due to fragmentation-based library prep or shearing
@@ -789,7 +822,8 @@ def processLamplicon(sw, process_candidates_path, generate_consensus_path, minim
         # if we have any hits, classify as background
         for hit in minimap2.map(lamplicon.seq):
 
-            print(hit)
+            if args.debug_print:
+                print(hit)
             
             # skip non-primary alignments
             if not hit.is_primary:
@@ -797,12 +831,12 @@ def processLamplicon(sw, process_candidates_path, generate_consensus_path, minim
             
             # if the hit is within fragment_limit of the target, mark it as a fragment
             if is_hit_near_target(hit, ref_vcf_record, fragment_limit):
-                classification = 'fragment'
-                return num_targets, classification, mut, wt
+                result.classification = 'fragment'
+                return result
             
             # else, just mark it as background
-            classification = 'background'
-            return num_targets, classification, mut, wt
+            result.classification = 'background'
+            return result
 
         
         # classify read as "ont" if it contains > 1 ONT sequence and fewer than 2 other suspected primer seqs and greater than 50% coverage
@@ -810,55 +844,32 @@ def processLamplicon(sw, process_candidates_path, generate_consensus_path, minim
 
             # get coverage
             if alignment_coverage >= 0.15:
-                classification = 'ont'
+                result.classification = 'ont'
             else:
                 # assume unknown
-                classification = 'unknown'
+                result.classification = 'unknown'
 
                 # try to align the read to see if it's a background genomic read
                 for hit in minimap2.map(lamplicon.seq):
-                    classification = 'background'
+                    result.classification = 'background'
 
-            return num_targets, classification, mut, wt
+            return result
                     
             
         # classify the read as spurious (bad/erroneous primer amplification) if it has at least 3 primer sequences, didn't align at the locus, and no target
         if len(alignments) >= 3:
-            classification = 'spurious'
-            return num_targets, classification, mut, wt
-
-        
-        # if there aren't any ont sequences or target/lamp sequences, then let's try to align this read to the human genome
-        # write separated targets to new FASTA file
-        #fastq_fn = "{}/tmp.fastq".format(args.output_dir)
-        #with open(fastq_fn, "w") as output_handle:
-        #    SeqIO.write(lamplicon, output_handle, "fastq")
-        
-        # map each target sequence; ignore secondary mappings 
-        #out_sam_tmp = "{}/tmp.sam".format(args.output_dir)
-        #subprocess.run(["minimap2","-a","-xmap-ont","--eqx","-t 1",
-        #                "-n 1", "-N 5", "--secondary=no", "-m 0", "-o{}".
-        #                format(out_sam_tmp),args.human_ref_fn,fastq_fn])
-
-        
-        #               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-
-        # parse sam file and see if there was a mapping to the human genome
-
-        #samfile = pysam.AlignmentFile(out_sam_tmp, 'r')
-        #for read in samfile:
-        #    if not read.is_unmapped:
-        #        classification = 'off_target'
+            result.classification = 'spurious'
+            return result
 
         # suspiciously short sequences might just be a fragment that can't align with enough identity
         if len(lamplicon.seq) < 60:
-            classification = 'short'
+            result.classification = 'short'
         else:
             # final default to unknown
-            classification = 'unknown'
+            result.classification = 'unknown'
 
         # Return the final classification
-        return num_targets, classification, mut, wt
+        return result
 
     ####################################
     # if we found a target....
@@ -894,10 +905,11 @@ def processLamplicon(sw, process_candidates_path, generate_consensus_path, minim
             target_idx += 1
 
     # Print intervals
-    print("* Found {} candidate sub-reads at intervals:".format(len(alignment_intervals)))
-    for interval in alignment_intervals:
-        print("  " + interval)
-    print("", flush=True)
+    if args.debug_print:
+        print("* Found {} candidate sub-reads at intervals:".format(len(alignment_intervals)))
+        for interval in alignment_intervals:
+            print("  " + interval)
+        print("", flush=True)
           
     # write separated targets to new FASTA file
     fasta_fn = "{}/{}.fasta".format(args.output_dir, lamp_idx)
@@ -909,7 +921,8 @@ def processLamplicon(sw, process_candidates_path, generate_consensus_path, minim
     #  STAGE 2: Map each sub-read against a smaller target reference #
     ##################################################################
     # map each sub read to the target sequence; ignore secondary mappings 
-    print("* Aligning candidate sub-reads...")
+    if args.debug_print:
+        print("* Aligning candidate sub-reads...")
     out_sam_all = "{}/{}_all.sam".format(args.output_dir, lamp_idx)
     out_bam = "{}/{}.bam".format(args.output_dir, lamp_idx)
     subprocess.run([process_candidates_path, fasta_fn, out_sam_all, args.target_ref_fn], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -924,9 +937,9 @@ def processLamplicon(sw, process_candidates_path, generate_consensus_path, minim
     for alt in target_vcf_record.ALT:
         variant = alt.value.upper()
 
-    print("  - Found {} reads that cover the target".format(depth))
-          
-    print("  - Pileup result: ",ref, depth, code_string, covers_roi)
+    if args.debug_print:
+        print("  - Found {} reads that cover the target".format(depth))
+        print("  - Pileup result: ",ref, depth, code_string, covers_roi)
 
     # in high confidence mode, ignore pileups that have less than 2 entries
     if args.high_confidence and depth < 2:
@@ -935,39 +948,42 @@ def processLamplicon(sw, process_candidates_path, generate_consensus_path, minim
     # if we don't cover the roi, then this was probably a fragment, off target, or spurious
     if not covers_roi:
         if within_roi:
-            classification = 'fragment'
+            result.classification = 'fragment'
         else:
-            classification = 'spurious'
-        return num_targets, classification, mut, wt
+            result.classification = 'spurious'
+        return result
         
     # parse code string and set mut/wt counts
     wt, mut = parsePileupCodeString(code_string, variant)
+    result.mut_count = mut
+    result.wt_count = wt
+    result.pileup_str = code_string
+    result.target_depth = depth
 
-    print("  - Found {} mut and {} wt calls".format(mut,wt))
+    if args.debug_print:
+        print("  - Found {} mut and {} wt calls".format(result.mut_count, result.wt_count))
             
-    # num targets is now the actual depth from the pileup
-    num_targets = depth
 
     ## TODO ## re-implement consensus polishing here. External call to Medaka?
 
     # if we don't have any targets after splitting, and aligning
-    if num_targets == 0:
+    if result.target_depth == 0:
 
         print("WHY!?!?!")
         exit(1)
 
         if len(alignments) >= 2:
-            classification = 'spurious'
+            result.classification = 'spurious'
         elif len(lamplicon.seq) < 60:
-            classification = 'short'
+            result.classification = 'short'
         else:
-            classification = 'unknown'
+            result.classification = 'unknown'
 
     # if we do cover the roi and have at least one target, we are  target read
     else:
-        classification = 'target'
+        result.classification = 'target'
 
-    return num_targets, classification, mut, wt
+    return result
 
 def initAligners(args):
     match = 2
@@ -980,8 +996,10 @@ def initAligners(args):
     if not minimap2: raise Exception("ERROR: failed to load/build index")
 
     return sw, minimap2
-        
-def main(args):
+
+
+#####
+def processLamplicons(args, primers, ref_vcf_record, target_vcf_record, lamplicon_batch, q):
 
     # get file directory for relative script paths
     dirname = os.path.dirname(__file__)
@@ -989,29 +1007,11 @@ def main(args):
     generate_consensus_path = os.path.join(dirname, 'scripts/generate_consensus.sh')
     os.makedirs(args.output_dir, exist_ok=True)
 
-    # parse all lamplicons from FASTQ file
-    print("> parsing lamplicons")
-    #lamplicon_seqs = [l.seq for l in SeqIO.parse(args.lamplicons_fn, "fastq")]
-    lamplicons = SeqIO.parse(args.lamplicons_fn, "fastq")
-    
-    # parse primers from config file
-    print("> parsing primers")
-    primers = PrimerSet(args.primer_set_fn)
-
-    # parse ref VCF file if there is one
-    if args.ref_vcf_fn != '':
-        ref_vcf_record = parseVCF(args.ref_vcf_fn)
-
-    # parse VCF file if there is one
-    if args.target_vcf_fn != '':
-        target_vcf_record = parseVCF(args.target_vcf_fn)
-    
     # initialize aligner
-    print("> initializing aligners")
+    if args.debug_print:
+        print("> initializing aligners")
     sw, minimap2 = initAligners(args)
     
-    # iterate over all lamplicon sequences
-    print("> splitting and mapping lamplicons")
     target_records = list()
     fragment_records = list()
     spurious_records = list()
@@ -1049,174 +1049,124 @@ def main(args):
     target_lamplicon_counter = 0
 
     start_time = 0.0
+
+    results = []
     
-    for lamp_idx,lamplicon in enumerate(lamplicons):
+    for lamp_idx,lamplicon in lamplicon_batch:
         
         # print status, stop early if we've found enough
         if args.max_lamplicons > 0 and lamp_idx >= args.max_lamplicons: break
         
-        print_green("Processing Lamplicon {} \r".format(lamp_idx + 1))
-        print_green(lamplicon.description.split()[5])
+        #print_green("Processing Lamplicon {} \r".format(lamp_idx + 1))
 
         timestamp = parseTimestamp(lamplicon.description.split()[5].split('=')[1])
 
-        if lamp_idx == 0:
+        if lamp_idx == lamplicon_batch[0][0]:
             start_time = timestamp
         
         timestamp_seconds =timestampDelta(start_time, timestamp)
         
-        num_targets,classification,mut,wt = processLamplicon(sw,
-                                                             process_candidates_path,
-                                                             generate_consensus_path,
-                                                             minimap2,
-                                                             lamp_idx,
-                                                             lamplicon,
-                                                             primers,
-                                                             ref_vcf_record,
-                                                             target_vcf_record,
-                                                             args);
-
+        result = processLamplicon(sw,
+                                  process_candidates_path,
+                                  generate_consensus_path,
+                                  minimap2,
+                                  lamp_idx,
+                                  lamplicon,
+                                  primers,
+                                  ref_vcf_record,
+                                  target_vcf_record,
+                                  args);
 
         # here, we can hijack the classification and inject our own VAF
         if simulate_vaf:
             target_vaf = 0.1
-            if classification == "target":
+            if result.classification == "target":
                 # roll the dice based on the VAF
                 # adjust mut/wt calls depending on the result of the dice
                 if rng.random() < target_vaf:
-                    mut = mut + wt
-                    wt = 0
-                else:
-                    # IMPORTANT: don't do anything to preserve error in wt dataset
-                    mut = mut
-                    wt = wt
+                    result.mut_count = result.mut_count + result.wt_count
+                    result.wt_count = 0
+                
+
+        # add to list of results
+        result.id = lamp_idx
+        result.timestamp = timestamp
+        results.append(result)
+
+        q.put(result)
+        
             
-        if classification == "target":
+#####
+def runProcess(thread_id, q, args, primers, rev_vcf_record, target_vcf_record, lamplicon_batch):
 
-            target_lamplicon_counter = target_lamplicon_counter + 1
-
-            # disaggregated totals (each target gets a vote)
-            mut_total = mut_total + mut
-            wt_total = wt_total + wt
-
-            # aggregated totals (each lamplicon gets a vote)
-            # consensus calling goes here
-            # calls must have majority (>50%)
-            if float(mut)/float(num_targets) > 0.5:
-                mut_reads = mut_reads + 1
-            elif float(wt)/float(num_targets) > 0.5:
-                wt_reads = wt_reads + 1
-
-        print("  - Classified as: " + classification)
-        class_counters[classification] = class_counters[classification] + 1
-        sys.stdout.write("  ")
-        print(class_counters)
+    processLamplicons(args, primers, rev_vcf_record, target_vcf_record, lamplicon_batch, q)
 
 
-        ### Track VAF over time
-        VAF_over_time.append((timestamp_seconds, mut_reads, wt_reads))
-        
-        if (mut_total + wt_total) > 0:
-            print("  - Disagg VAF: {}/{} {}".format(mut_total, mut_total + wt_total, float(mut_total)/(float(mut_total)+float(wt_total))))
-            print("  - Aggreg VAF: {}/{} {}".format(mut_reads, mut_reads + wt_reads, float(mut_reads)/(float(mut_reads)+float(wt_reads))))
+def main(args):
 
+    # load and parse files
+    # parse all lamplicons from FASTQ file
+    print("> parsing lamplicons")
+    #lamplicon_seqs = [l.seq for l in SeqIO.parse(args.lamplicons_fn, "fastq")]
+    raw_lamplicons = SeqIO.parse(args.lamplicons_fn, "fastq")
 
-            error_rate = 0.015
-            
-            print("* VAF Confidence Intervals: ")
-            sys.stdout.write("  ")
-            conf = 0.999
-            error_low, error_mean, error_high = proportionConfidenceInterval(error_rate * (mut_reads+wt_reads), (1.0 - error_rate) * (mut_reads+wt_reads), conf)
-            variant_low, variant_mean, variant_high = proportionConfidenceInterval(mut_reads, wt_reads, conf)
-            result_str = "conf: {} {:.4f} -- {:.2f} -- {:.4f}".format(conf, variant_low*100.0, variant_mean, variant_high*100.0)
-
-            # print in green if call is statistically significant above ONT error rate
-            if error_high < variant_low:
-                print_green(result_str)
-            else:
-                print(result_str)
-
-            sys.stdout.write("  ")
-            proportionConfidenceInterval(mut_reads, wt_reads, 0.99)
-            sys.stdout.write("  ")
-            proportionConfidenceInterval(mut_reads, wt_reads, 0.999)
-            sys.stdout.write("  ")
-            proportionConfidenceInterval(mut_reads, wt_reads, 0.9999)
-
-        # Add record to list
-        if classification == 'target':
-            target_records.append(lamplicon)
-        elif classification == 'fragment':
-            fragment_records.append(lamplicon)
-        elif classification == 'spurious':
-            spurious_records.append(lamplicon)
-        elif classification == 'ont':
-            ont_records.append(lamplicon)
-        elif classification == 'background':
-            background_records.append(lamplicon)
-        elif classification == 'short':
-            short_records.append(lamplicon)
-        elif classification == 'unknown':
-            unknown_records.append(lamplicon)
-
-
-        # keep track of each sequence based on how many targets they have
-        if classification == "target":
-            if num_targets not in target_sequence_map.keys():
-                target_sequence_map[num_targets] = list()
-
-            target_sequence_map[num_targets].append(lamplicon)
-        
-        # sort the target count histogram
-        target_sequence_map = collections.OrderedDict(sorted(target_sequence_map.items()))
-        print("")
-        
-    print("")
-
+    # give each lamplicon an id
+    lamplicons = []
+    id_counter = 0
+    for lamplicon in raw_lamplicons:
+        lamplicons.append((id_counter, lamplicon))
+        id_counter = id_counter + 1
     
-    if(args.save_target_reads):
-        # write out on-target/off-target splits
-        with open("{}/target_records.fastq".format(args.output_dir), "w") as output_handle:
-            SeqIO.write(target_records, output_handle, "fastq")
+    # parse primers from config file
+    print("> parsing primers")
+    primers = PrimerSet(args.primer_set_fn)
 
-        with open("{}/ont_records.fastq".format(args.output_dir), "w") as output_handle:
-            SeqIO.write(ont_records, output_handle, "fastq")
+    # parse ref VCF file if there is one
+    if args.ref_vcf_fn != '':
+        ref_vcf_record = parseVCF(args.ref_vcf_fn)
 
-        with open("{}/unknown_records.fastq".format(args.output_dir), "w") as output_handle:
-            SeqIO.write(unknown_records, output_handle, "fastq")
-
+    # parse VCF file if there is one
+    if args.target_vcf_fn != '':
+        target_vcf_record = parseVCF(args.target_vcf_fn)
     
-    # print summary stats
-    if args.print_summary_stats:
-        total_records = len(target_records) + len(fragment_records) + len(spurious_records) + len(ont_records) + len(background_records) + len(short_records) + len(unknown_records)
-        results_str = ''
-        results_str = results_str + "> SUMMARY Statistics:\n"
-        results_str = results_str + "> Examined {} lamplicons\n".format(total_records)
-        results_str = results_str + ">  Found {}/{} suspected target lamplicons\n".format(len(target_records), total_records)
-        results_str = results_str + ">  Found {}/{} suspected ont sequences\n".format(len(ont_records), total_records)
-        results_str = results_str + ">  Found {}/{} sequences of unknown origin\n".format(len(unknown_records), total_records)
-        results_str = results_str + ">  Disaggregate VAF (each target gets a vote): {}/{}\n".format(mut_total,(mut_total+wt_total))
-        results_str = results_str + ">  Aggregate VAF (each lamplicon gets a vote): {}/{}\n".format(mut_reads,(mut_reads+wt_reads))
-        results_str = results_str + ">  Concatemer Length Histogram:\n"
-        for num_targets, target_read_list in target_sequence_map.items():
-            results_str = results_str + ">    {} : {}\n".format(num_targets, len(target_read_list))
 
-        print(results_str)
+    # 
+    q = multiprocessing.Queue()
+    processes = []
+    results = []
+    num_processes = 3
 
-    # write stats to output file
-    with open("{}/summary_stats.txt".format(args.output_dir), "w") as output_handle:
-        output_handle.write(results_str)
+    lamplicon_batch = []
+    for i in range(num_processes):
+        lamplicon_batch.append(list())
+        
+    for i in range(len(lamplicons)):
+        lamplicon_batch[i % num_processes].append(lamplicons[i])
 
-    # write groups of concatemer lengths to different files
-    if args.save_concatemers:
-        for num_targets, target_read_list in target_sequence_map.items():
-            with open("{}/{}_targets.fastq".format(args.output_dir, num_targets), "w") as output_handle:
-                SeqIO.write(target_read_list, output_handle, "fastq")
+    # allocate processes
+    print("> Launching {} processes and initializing aligners...".format(num_processes))
+    for i in range(num_processes):
+        processes.append(multiprocessing.Process(target = runProcess, args = (i, q, args, primers, ref_vcf_record, target_vcf_record, lamplicon_batch[i])))
 
-    # write VAF over time entries to file
-    with open("{}/VAF_over_time.txt".format(args.output_dir), 'w') as fp:
-            fp.write('\n'.join("{} {} {}".format(x[0], x[1], x[2]) for x in VAF_over_time))
+    # launch processes
+    for i in range(num_processes):
+        processes[i].start()
 
+    # collect results
+    for i in progressbar(range(len(lamplicons))):
+        heapq.heappush(results, q.get(True))
+        i = i + 1
+        
+    # wait for jobs to complete
+    for i in range(num_processes):
+        processes[i].join()
+
+    # process results
+    print("DONE!")
+    #for result in results:
+    #    print(result.timestamp, result.classification)
+    #    printPrimerAlignments(result.seq.seq, result.alignments)
+        
 def argparser():
     parser = argparse.ArgumentParser()
     parser.add_argument("target_ref_fn")
