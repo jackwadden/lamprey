@@ -1,6 +1,7 @@
 #!/usr/bin/python
 
 import sys, os, subprocess, argparse, collections
+import random
 import heapq
 import time
 import multiprocessing
@@ -141,6 +142,9 @@ class Result:
         self.wt_count = wt_count
         self.pileup_str = pileup_str
         self.target_depth = target_depth
+        self.target_seq_accuracy = (0,0)
+        self.bad_calls = None
+        self.polished_bad_calls = None
         self.alignments = alignments
         self.seq = seq
         self.id = id
@@ -676,6 +680,79 @@ def parsePileupCodeString(code_string, variant):
                           
 
 ################################################
+def countCallsFromPileup(ref_char, pileup_str):
+
+    pileup_calls = dict()
+    pileup_calls['a'] = 0
+    pileup_calls['t'] = 0
+    pileup_calls['g'] = 0
+    pileup_calls['c'] = 0
+    pileup_calls['*'] = 0 # deletion
+    
+    #
+    total_count = 0
+    skip_counter = 0
+    set_skip = False
+
+    for c in pileup_str:
+
+        if(skip_counter > 0):
+            skip_counter = skip_counter - 1
+            continue
+
+        if(set_skip):
+            skip_counter = int(c)
+            set_skip = False
+            continue
+
+        total_count = total_count + 1
+
+        if c == ',' or c == '.':
+            pileup_calls[ref_char.lower()] = pileup_calls[ref_char.lower()] + 1
+
+        elif c.lower() in pileup_calls.keys():
+            pileup_calls[c.lower()] = pileup_calls[c.lower()] + 1
+
+        elif c == '-' or c == '+':
+            set_skip = True
+
+        elif c == '^':
+            skip_counter = 1
+            
+    return pileup_calls
+
+################################################
+def getPluralityVoter(calls):
+
+    total_calls = sum(calls.values())
+
+    # is there a plurality voter?
+    plural_bases = set()
+    majority_base = ''
+    majority_vote = False
+    max_count = 0
+    for base, count in calls.items():
+
+        if count > max_count:
+            max_count = count
+            majority_base = base
+            majority_vote = True
+                                                                
+        if count == max_count:
+            plurality_vote = False
+
+    for base, count in calls.items():
+        if count == max_count:
+            plural_bases.add(base)
+                                
+    # if there was a plurality vote, pick that
+    # else choose, random call among the tied plurality
+    if majority_vote == False and plurality_vote == False:
+        majority_base = random.choice(plural_bases)
+
+    return majority_base, max_count
+
+################################################
 def extractPileupInfo(pileup_fn, contig, target_locus, limit):
     # parse lines in the pileup, extract the depth at the locus
 
@@ -684,13 +761,21 @@ def extractPileupInfo(pileup_fn, contig, target_locus, limit):
     code_string = ''
     covers_roi = False
     within_roi = False
+
+    vote_count = 0
+    ref_match_count = 0
+
+    bad_calls = dict({'a' : 0, 't' : 0, 'c' : 0, 'g' : 0, '*' : 0, 'ref' : 0})
+    polished_bad_calls = dict({'a' : 0, 't' : 0, 'c' : 0, 'g' : 0, '*' : 0, 'ref' : 0})
+    
     with open(pileup_fn) as fp:
         for line in fp:
             fields = line.split('\t')
             if fields[0] == contig:
 
                 pileup_locus = int(fields[1])
-                
+
+                # retrieve target specific information
                 if pileup_locus == target_locus:
                     ref = fields[2]
                     depth = int(fields[3])
@@ -698,8 +783,39 @@ def extractPileupInfo(pileup_fn, contig, target_locus, limit):
                     covers_roi = True
                 elif pileup_locus < (target_locus + limit) and pileup_locus > (target_locus - limit):
                     within_roi = True
-                
-    return ref, depth, code_string, covers_roi, within_roi
+
+                # consider entire read accuracy if the number of votes is 2+
+                locus_depth = int(fields[3])
+
+                if locus_depth > 0 and pileup_locus != target_locus:
+
+                    locus_code_string = fields[4]
+                    locus_ref = fields[2].lower()
+                    
+                    calls = countCallsFromPileup(locus_ref, locus_code_string)
+                    majority_base, count = getPluralityVoter(calls)
+                    
+
+                    # is majority/random base right or wrong?
+                    if majority_base == locus_ref.lower():
+                        ref_match_count = ref_match_count + 1
+                        polished_bad_calls['ref'] = polished_bad_calls['ref'] + 1
+                    else:
+                        polished_bad_calls[majority_base] = polished_bad_calls[majority_base] + 1
+                        
+                    vote_count = vote_count + 1
+
+                    # collect all incorrect calls
+                    
+                    for key in bad_calls:
+                        if key in calls:
+                            if key == locus_ref.lower():
+                                bad_calls['ref'] = bad_calls['ref'] + calls[key]
+                            else:
+                                bad_calls[key] = bad_calls[key] + calls[key]
+                    
+                        
+    return ref, depth, code_string, covers_roi, within_roi, ref_match_count, vote_count, bad_calls, polished_bad_calls
 
 ################################################
 def generatePileup(bam_to_pileup_sh, ref_fn, bam_fn, out_fn):
@@ -726,6 +842,17 @@ def proportionConfidenceInterval(mut, wt, conf):
 
     return conf_int[0], samp_mean, conf_int[1]
 
+def isStatisticallySignificant(mut, wt, conf, err):
+
+    total = mut + wt
+    err_low, err_mean, err_high = proportionConfidenceInterval(err * float(total), (1.0 - err) * float(total), conf)
+    obs_low, obs_mean, obs_high = proportionConfidenceInterval(mut, wt, conf)
+
+    if (obs_low > err_high):
+        return True
+    else:
+        return False
+    
     
 ################################################
 def parseVCF(vcf_fn):
@@ -946,8 +1073,18 @@ def processLamplicon(sw, process_candidates_path, generate_consensus_path, minim
         
     # extract pileup info
     limit = 1000
-    ref, depth, code_string, covers_roi, within_roi = extractPileupInfo(pileup_fn, target_vcf_record.CHROM, target_vcf_record.POS, limit)
+    ref, depth, code_string, covers_roi, within_roi, correct_voted_bases, total_voted_bases, bad_calls, polished_bad_calls = extractPileupInfo(pileup_fn, target_vcf_record.CHROM, target_vcf_record.POS, limit)
 
+    # 
+    #if total_voted_bases > 0:
+    #    print("************** {}/{} {}%".format(correct_voted_bases, total_voted_bases, float(correct_voted_bases)/float(total_voted_bases) * 100.0))
+    #else:
+    #    print("************** {}/{} {}%".format(correct_voted_bases, 0, "NA"))
+
+    result.target_seq_accuracy = (correct_voted_bases, total_voted_bases)
+    result.bad_calls = bad_calls
+    result.polished_bad_calls = polished_bad_calls
+    
     for alt in target_vcf_record.ALT:
         variant = alt.value.upper()
 
@@ -957,7 +1094,9 @@ def processLamplicon(sw, process_candidates_path, generate_consensus_path, minim
 
     # in high confidence mode, ignore pileups that have less than 2 entries
     if args.high_confidence and depth < 2:
-        return 0, 'unknown', 0, 0
+        #0, 'unknown', 0, 0
+        # TODO fix result assignment to zero here
+        return result 
     
     # if we don't cover the roi, then this was probably a fragment, off target, or spurious
     if not covers_roi:
@@ -980,6 +1119,8 @@ def processLamplicon(sw, process_candidates_path, generate_consensus_path, minim
 
     ## TODO ## re-implement consensus polishing here. External call to Medaka?
 
+    # polish the target sequence
+    
     # if we don't have any targets after splitting, and aligning
     if result.target_depth == 0:
 
@@ -999,6 +1140,8 @@ def processLamplicon(sw, process_candidates_path, generate_consensus_path, minim
 
     return result
 
+
+#######
 def initAligners(args):
     match = 2
     mismatch = -1
@@ -1101,6 +1244,7 @@ def main(args):
     results = []
     num_processes = 3
 
+    # divvy up work
     lamplicon_batch = []
     for i in range(num_processes):
         lamplicon_batch.append(list())
@@ -1118,37 +1262,139 @@ def main(args):
         processes[i].start()
 
     # collect results
-    for i in progressbar(range(len(lamplicons))):
-        heapq.heappush(results, q.get(True))
-        i = i + 1
+    # priority queue will sort based on timestamp
+    if not args.debug_print:
+        for i in progressbar(range(len(lamplicons))):
+            heapq.heappush(results, q.get(True))
+            i = i + 1
+    else:
+        for i in range(len(lamplicons)):
+            heapq.heappush(results, q.get(True))
         
     # wait for jobs to complete
     for i in range(num_processes):
         processes[i].join()
 
-    print(" * Finished processing all reads.")
+    print("  * Finished processing all reads.")
         
     # process results
     target_counter = 0
     mut_count = 0
     wt_count = 0
+
+    statistical_significance_map = dict()
+    num_targets_map = dict()
+    all_bad_calls = dict({'a' : 0, 't' : 0, 'c' : 0, 'g' : 0, '*' : 0, 'ref' : 0})
+    all_polished_bad_calls = dict({'a' : 0, 't' : 0, 'c' : 0, 'g' : 0, '*' : 0, 'ref' : 0})
+    
+    total_correct_calls = 0
+    total_calls = 0
+    
+    time_ordered_index = 0
     for result in results:
 
         if result.classification == 'target':
             target_counter = target_counter + 1
 
+        # build histogram of target count
+        if result.target_depth not in num_targets_map.keys():
+            num_targets_map[result.target_depth] = 1
+        else:
+            num_targets_map[result.target_depth] = num_targets_map[result.target_depth] + 1
+
+            
+        # mut/wt counting. majority vote among sections.
         if result.target_depth > 0:
-            if float(result.mut_count)/float(result.target_depth):
+            if float(result.mut_count)/float(result.target_depth) > 0.5:
                 mut_count = mut_count + 1
 
-            if float(result.wt_count)/float(result.target_depth):
+            if float(result.wt_count)/float(result.target_depth) > 0.5:
                 wt_count = wt_count + 1
 
+
+        total_correct_calls = total_correct_calls + result.target_seq_accuracy[0]
+        total_calls = total_calls + result.target_seq_accuracy[1]
+
+        # collect all bad calls to identify basecall error trends
+        if result.bad_calls is not None:
+            for key in all_bad_calls:
+                if key in result.bad_calls:
+                    all_bad_calls[key] = all_bad_calls[key] + result.bad_calls[key]
+
+        # collect all bad calls to identify basecall error trends
+        if result.polished_bad_calls is not None:
+            for key in all_polished_bad_calls:
+                if key in result.polished_bad_calls:
+                    all_polished_bad_calls[key] = all_polished_bad_calls[key] + result.polished_bad_calls[key]
+
+
+        
+        #
+        if mut_count + wt_count > 0:
+            
+            # confidence intervals
+            err = 0.015
+            conf = 0.95
+        
+            if isStatisticallySignificant(mut_count, wt_count, conf, err) and (conf not in statistical_significance_map.keys()):
+                statistical_significance_map[conf] = time_ordered_index + 1
+
+            conf = 0.99
+            if isStatisticallySignificant(mut_count, wt_count, conf, err) and (conf not in statistical_significance_map.keys()):
+                statistical_significance_map[conf] = time_ordered_index + 1
+
+            conf = 0.999
+            if isStatisticallySignificant(mut_count, wt_count, conf, err) and (conf not in statistical_significance_map.keys()):
+                statistical_significance_map[conf] = time_ordered_index + 1
+
+            conf = 0.9999
+            if isStatisticallySignificant(mut_count, wt_count, conf, err) and (conf not in statistical_significance_map.keys()):
+                statistical_significance_map[conf] = time_ordered_index + 1
+
+        time_ordered_index = time_ordered_index + 1
+            
+    # Summary results
+    low, samp_mean, high = proportionConfidenceInterval(mut_count, wt_count, 0.95)
+        
     # print results
-    print("\nResult Summary:")
+    print("")
+    print("|---------------------|")
+    print("|   Summary Results   |")
+    print("|---------------------|")
     print(" Target Fraction: {:.2f}%".format(float(target_counter)/float(len(lamplicons)) * 100.0))
     print(" VAF: {:.2f}%".format(float(mut_count)/float(mut_count + wt_count) * 100.0))
-        
+    low, samp_mean, high = proportionConfidenceInterval(mut_count, wt_count, 0.95)
+    print("   95%    CI: {:.2f}% -- {:.2f}%".format(low * 100.0, high * 100.0))
+    low, samp_mean, high = proportionConfidenceInterval(mut_count, wt_count, 0.99)
+    print("   99%    CI: {:.2f}% -- {:.2f}%".format(low * 100.0, high * 100.0))
+    low, samp_mean, high = proportionConfidenceInterval(mut_count, wt_count, 0.999)
+    print("   99.9%  CI: {:.2f}% -- {:.2f}%".format(low * 100.0, high * 100.0))
+    low, samp_mean, high = proportionConfidenceInterval(mut_count, wt_count, 0.9999)
+    print("   99.99% CI: {:.2f}% -- {:.2f}%".format(low * 100.0, high * 100.0))
+
+    print("   Read # when variant call statistically significant vs. {}% error: ".format(err * 100.0), statistical_significance_map)
+
+
+    print(" LAMP Concatemer Histogram:")
+    longest_concatemer = max(num_targets_map.keys())
+    for i in range(longest_concatemer + 1):
+        if i in num_targets_map.keys():
+            print("   {} : {}".format(i, num_targets_map[i]))
+        else:
+            print("   {} : {}".format(i, 0))
+
+    print(" Average Aligned Read Accuracy:")
+    if total_calls > 0:
+        print("    {}/{} {}%".format(total_correct_calls, total_calls, float(total_correct_calls)/float(total_calls)*100.0))
+    else:
+        print("    {}/{} {}%".format(total_correct_calls, total_calls, 'NA'))
+
+    print(" Error call distribution:")
+    print("    {}".format(all_bad_calls))
+    print(" Polished error call distribution:")
+    print("    {}".format(all_polished_bad_calls))
+    
+    
 def argparser():
     parser = argparse.ArgumentParser()
     parser.add_argument("target_ref_fn")
