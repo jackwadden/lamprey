@@ -1242,7 +1242,7 @@ def main(args):
     q = multiprocessing.Queue()
     processes = []
     results = []
-    num_processes = 3
+    num_processes = args.num_threads
 
     # divvy up work
     lamplicon_batch = []
@@ -1413,6 +1413,7 @@ def argparser():
     parser.add_argument("--print_summary_stats", action="store_true", default=False)
     parser.add_argument("--save_concatemers", action="store_true", default=False)
     parser.add_argument("--high_confidence", action="store_true", default=False)
+    parser.add_argument("--num_threads", type=int, default=1)
     
     return parser
 
