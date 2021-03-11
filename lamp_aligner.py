@@ -1075,6 +1075,9 @@ def processLamplicon(sw, process_candidates_path, generate_consensus_path, minim
     limit = 1000
     ref, depth, code_string, covers_roi, within_roi, correct_voted_bases, total_voted_bases, bad_calls, polished_bad_calls = extractPileupInfo(pileup_fn, target_vcf_record.CHROM, target_vcf_record.POS, limit)
 
+    # polish original read
+    
+    
     # 
     #if total_voted_bases > 0:
     #    print("************** {}/{} {}%".format(correct_voted_bases, total_voted_bases, float(correct_voted_bases)/float(total_voted_bases) * 100.0))
@@ -1175,8 +1178,11 @@ def processLamplicons(args, primers, ref_vcf_record, target_vcf_record, lamplico
         
         #print_green("Processing Lamplicon {} \r".format(lamp_idx + 1))
 
-        timestamp = parseTimestamp(lamplicon.description.split()[5].split('=')[1])
-        
+        if args.time_sort:
+            timestamp = parseTimestamp(lamplicon.description.split()[5].split('=')[1])
+        else:
+            timestamp = 0
+            
         result = processLamplicon(sw,
                                   process_candidates_path,
                                   generate_consensus_path,
@@ -1211,7 +1217,11 @@ def main(args):
     # parse all lamplicons from FASTQ file
     print("> Parsing lamplicon file: {}".format(args.lamplicons_fn))
     #lamplicon_seqs = [l.seq for l in SeqIO.parse(args.lamplicons_fn, "fastq")]
-    raw_lamplicons = SeqIO.parse(args.lamplicons_fn, "fastq")
+
+    if args.lamplicons_fn.endswith(".fastq"):
+        raw_lamplicons = SeqIO.parse(args.lamplicons_fn, "fastq")
+    elif args.lamplicons_fn.endswith(".fasta"):
+        raw_lamplicons = SeqIO.parse(args.lamplicons_fn, "fasta")
 
     # give each lamplicon an id
     lamplicons = []
@@ -1362,7 +1372,7 @@ def main(args):
     print("|   Summary Results   |")
     print("|---------------------|")
     print(" Target Fraction: {:.2f}%".format(float(target_counter)/float(len(lamplicons)) * 100.0))
-    print(" VAF: {:.2f}%".format(float(mut_count)/float(mut_count + wt_count) * 100.0))
+    print(" VAF: {:.2f}% ({}/{})".format(float(mut_count)/float(mut_count + wt_count) * 100.0, mut_count, (mut_count + wt_count)))
     low, samp_mean, high = proportionConfidenceInterval(mut_count, wt_count, 0.95)
     print("   95%    CI: {:.2f}% -- {:.2f}%".format(low * 100.0, high * 100.0))
     low, samp_mean, high = proportionConfidenceInterval(mut_count, wt_count, 0.99)
@@ -1414,6 +1424,7 @@ def argparser():
     parser.add_argument("--save_concatemers", action="store_true", default=False)
     parser.add_argument("--high_confidence", action="store_true", default=False)
     parser.add_argument("--num_threads", type=int, default=1)
+    parser.add_argument("--time_sort", action="store_true", default=False)
     
     return parser
 
