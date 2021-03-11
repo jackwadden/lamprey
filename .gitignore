@@ -2,7 +2,7 @@ venv*
 
 data/
 results/
-run.sh
+run*.sh
 
 *.png
 
