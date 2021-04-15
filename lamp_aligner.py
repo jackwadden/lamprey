@@ -1111,10 +1111,13 @@ def processLamplicon(sw, process_candidates_path, generate_consensus_path, minim
             print("  - Could not confirm genomic read, diagnosing further...")
                 
     ####################################
-    # if we found a target....
-    # classify the read
+    # if we found a suspected target seed
+    # attempt to extend seed, and align to target region
     if result.target_depth > 0:
-        
+
+        ###############################################################################
+        #  STAGE 1: extend target seed to left/right to identify candidate sub-reads  #
+        ###############################################################################
         # extend each target into a single amplicon and emit as fasta
         target_idx = 0
         targets = []
@@ -1164,9 +1167,9 @@ def processLamplicon(sw, process_candidates_path, generate_consensus_path, minim
             SeqIO.write(targets, output_handle, "fasta")
 
 
-        ##################################################################
-        #  STAGE 2: Map each sub-read against a smaller target reference #
-        ##################################################################
+        ######################################################################
+        #  STAGE 2: Map each sub-read candidate against the target reference #
+        ######################################################################
         # map each sub read to the target sequence; ignore secondary mappings 
         if args.debug_print:
             print("* Aligning candidate sub-reads...")
@@ -1183,18 +1186,10 @@ def processLamplicon(sw, process_candidates_path, generate_consensus_path, minim
         ###############################
         result.polished_seq = polishLamplicon(lamplicon, subread_alignment_fn, alignment_interval_dict)
 
-        ################################################
-    
+        ###############################
         # extract pileup info
         limit = 1000
         ref, depth, code_string, covers_roi, within_roi, correct_voted_bases, total_voted_bases, bad_calls, polished_bad_calls = extractPileupInfo(pileup_fn, target_vcf_record.CHROM, target_vcf_record.POS, limit)
-
-    
-        # 
-        #if total_voted_bases > 0:
-        #    print("************** {}/{} {}%".format(correct_voted_bases, total_voted_bases, float(correct_voted_bases)/float(total_voted_bases) * 100.0))
-        #else:
-        #    print("************** {}/{} {}%".format(correct_voted_bases, 0, "NA"))
 
         result.target_seq_accuracy = (correct_voted_bases, total_voted_bases)
         result.bad_calls = bad_calls
@@ -1217,6 +1212,7 @@ def processLamplicon(sw, process_candidates_path, generate_consensus_path, minim
             # TODO fix result assignment to zero here
             return result 
 
+        # a sub-read that successfully aligns to and covers the target locus is confirmed as a target sequence
         if result.target_depth > 0:
             result.classification = 'target'
         
@@ -1234,7 +1230,7 @@ def processLamplicon(sw, process_candidates_path, generate_consensus_path, minim
 
             if args.debug_print:
                 print("  - Found {} mut and {} wt calls".format(result.mut_count, result.wt_count))
-                print("  - Plurality call: {}".format(result.plural_base))
+                print("  - Plural basecall: {}".format(result.plural_base))
 
 
     #######################################
@@ -1298,7 +1294,7 @@ def processLamplicon(sw, process_candidates_path, generate_consensus_path, minim
             return result
                     
             
-        # classify the read as spurious (bad/erroneous primer amplification) if it has at least 3 primer sequences, didn't align at the locus, and no target
+        # classify the read as spurious (bad/erroneous primer amplification) if it has at least 3 primer sequences, didn't align at the locus, and no alignable target
         if len(alignments) >= 3:
             if args.debug_print:
                 print(" - Diagnosing as spurious.")
