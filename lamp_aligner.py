@@ -893,6 +893,160 @@ def timestampDelta(start, end):
     delta = end - start
     return delta.total_seconds()
 
+##############################################
+def polishLamplicon(lamplicon, subread_alignment_file, alignment_interval_dict):
+
+    # generate new read from lamplicon.seq substring
+    polished_lamplicon = SeqRecord(lamplicon.seq,
+                                   id = lamplicon.id,
+                                   name = lamplicon.name,
+                                   description = lamplicon.description
+    )
+
+    
+    # parse the samfile into pysam
+    pileup_alignments = pysam.AlignmentFile(subread_alignment_file, "r")
+
+    # generate pileup over target region
+    pileup_iter = pileup_alignments.pileup(truncate=True,
+                                           stepper="samtools",
+                                           min_base_quality=0,
+                                           ignore_overlaps=False,
+                                           ignore_orphans=False)
+
+    deletion_removal_list = list()
+    
+    # iterate over the pileup
+    deletion_streak_counters = dict()
+
+    # for each pileup position
+    for column in pileup_iter:
+
+        calls = dict({'a' : 0, 't' : 0, 'c' : 0, 'g' : 0, '*' : 0, 'ref' : 0})
+        call_count = 0
+
+        # get the position in the sub-read for this column
+        # NOTE: deletions return the location "before" the deletion position in the alignment
+        query_positions = column.get_query_positions()
+        
+        # gather all votes and positions in mother read
+        for read in column.pileups:
+            
+            # deletion
+            if read.is_del:
+                calls['*'] = calls['*'] + 1
+                call_count = call_count + 1
+            # insertion (skip)
+            elif read.is_refskip:
+                continue
+            # mismatch
+            else:
+                #print(read.query_position)
+                #print(read.alignment.query_sequence)
+                base = read.alignment.query_sequence[read.query_position].lower() 
+                #print("BASE: {}".format(base))
+                #print(read.alignment.query_sequence)
+                calls[base] = calls[base] + 1
+                call_count = call_count + 1
+
+        # compute plurality vote
+        vote_base, plurality_count = getPluralityVoter(calls)
+        #print(vote_base, plurality_count)
+
+
+        # if we end up with zero votes, skip this location
+        if plurality_count < 1:
+            continue
+                
+        # polish bases in mother read
+        read_idx = 0
+        for read in column.pileups:
+
+            # get sub-read direction info
+            read_start, read_end, direction = alignment_interval_dict[read.alignment.query_name]
+
+            # where does this base lie?
+            offset = query_positions[read_idx]            
+
+            # if the sub-read aligns to the mother in the forard direction
+            if direction == 'fwd':
+                base = vote_base.upper()
+                # if the sub-read aligns to the reference in the forward
+                if not read.alignment.is_reverse:
+                    mother_pos = read_start + offset
+                else:
+                    mother_pos = read_end - 1 - offset
+
+            # if the sub-read aligns to the mother in the reverse direction
+            else:
+                base = rc(vote_base.upper())
+                # if the sub-read aligns to the reference in the forward
+                if not read.alignment.is_reverse:
+                    mother_pos = read_start + offset
+                # if the sub-read aligns to the reference in the reverse direction
+                else:
+                    mother_pos = read_end - 1 - offset
+
+            # if we need to polish a deletion, save it and we'll handle it later
+            # if we are a deletion, and the polished base is a deletion, skip/ignore
+            if read.is_del and base != '*':
+                if len(deletion_removal_list) > 0 and deletion_removal_list[-1][0] == mother_pos:
+                    deletion_removal_list[-1][1].append(base)
+                else:
+                    deletion_removal_list.append((mother_pos, [base], direction))
+                    
+            # polish the base in the mother read
+            else:
+                    
+                # adjust mother read
+                polished_lamplicon.seq = polished_lamplicon.seq[:mother_pos] + base + polished_lamplicon.seq[mother_pos + 1:]
+            
+            # cleanup
+            read_idx = read_idx + 1
+
+    # for each deletion, make sure to insert the voted base in the correct
+    # order at the right index. Offsets/coordinates are always in the read direction
+
+    # sort so we add left->right in the mother read
+    deletion_removal_list = sorted(deletion_removal_list)
+    #print(deletion_removal_list)
+
+    # offset counter accounts for inserted bases into the mother read that weren't there before
+    # anytime we insert, we adjust the offset counter
+    offset_counter = 0
+    for position, base_list, direction in deletion_removal_list:
+
+        # if we're a reverse aligned read, deletions are in the opposite order
+        # add in 
+        #  starting at the beginning (reverse end) if there's a run of deletions
+        if direction == 'rev':
+
+            base_list.reverse()
+            for base in base_list:
+
+                # add 1 to offset because we flipped directions
+                final_position = position + offset_counter + 1            
+                polished_lamplicon.seq = polished_lamplicon.seq[:final_position] + base + polished_lamplicon.seq[final_position:]
+                
+                # update offset counter because we added a base
+                offset_counter = offset_counter + 1
+
+        # if we're a forward aligned read, add in forward order as encountered
+        else:
+
+            for base in base_list:
+            
+                final_position = position + offset_counter
+                polished_lamplicon.seq = polished_lamplicon.seq[:final_position] + base + polished_lamplicon.seq[final_position:]
+                
+                # update offset counter because we added a base
+                offset_counter = offset_counter + 1
+                
+            
+    # actually delete any '*' deletions from the polished read
+    polished_lamplicon.seq = Seq(str(polished_lamplicon.seq).replace("*",""))
+
+    return polished_lamplicon
 
 ################################################
 def processLamplicon(sw, process_candidates_path, generate_consensus_path, minimap2, lamp_idx, lamplicon, primers, ref_vcf_record, target_vcf_record, args):
@@ -956,13 +1110,11 @@ def processLamplicon(sw, process_candidates_path, generate_consensus_path, minim
         if args.debug_print:
             print("  - Could not confirm genomic read, diagnosing further...")
                 
-    # if there were no targets identified over the threshold
+    ####################################
+    # if we found a target....
     # classify the read
     if result.target_depth > 0:
-
-        ####################################
-        # if we found a target....
-
+        
         # extend each target into a single amplicon and emit as fasta
         target_idx = 0
         targets = []
@@ -1019,7 +1171,7 @@ def processLamplicon(sw, process_candidates_path, generate_consensus_path, minim
         if args.debug_print:
             print("* Aligning candidate sub-reads...")
         out_sam_all = "{}/{}_all.sam".format(args.output_dir, lamp_idx)
-        out_bam = "{}/{}_all.bam".format(args.output_dir, lamp_idx)
+        subread_alignment_fn = "{}/{}_all.bam".format(args.output_dir, lamp_idx)
         subprocess.run([process_candidates_path, fasta_fn, out_sam_all, args.target_ref_fn], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
         # output pileup generated by process_candidates.sh
@@ -1029,159 +1181,7 @@ def processLamplicon(sw, process_candidates_path, generate_consensus_path, minim
         ###############################
         #  Polish orig read and emit  #
         ###############################
-        # generate new read from lamplicon.seq substring
-        polished_lamplicon = SeqRecord(lamplicon.seq,
-                                       id = lamplicon.id,
-                                       name = lamplicon.name,
-                                       description = lamplicon.description
-        )
-
-    
-        # ignore this pileup and parse the samfile into pysam
-        pileup_alignments = pysam.AlignmentFile(out_bam, "r")
-
-        # generate pileup over target region
-        pileup_iter = pileup_alignments.pileup(truncate=True,
-                                               stepper="samtools",
-                                               min_base_quality=0,
-                                               ignore_overlaps=False,
-                                               ignore_orphans=False)
-
-        deletion_removal_list = list()
-    
-        # iterate over the pileup
-        deletion_streak_counters = dict()
-
-        # for each pileup position
-        for column in pileup_iter:
-
-            calls = dict({'a' : 0, 't' : 0, 'c' : 0, 'g' : 0, '*' : 0, 'ref' : 0})
-            call_count = 0
-
-            # get the position in the sub-read for this column
-            # NOTE: deletions return the location "before" the deletion position in the alignment
-            query_positions = column.get_query_positions()
-                
-            # gather all votes and positions in mother read
-            for read in column.pileups:
-            
-                # deletion
-                if read.is_del:
-                    calls['*'] = calls['*'] + 1
-                    call_count = call_count + 1
-                # insertion (skip)
-                elif read.is_refskip:
-                    continue
-                # mismatch
-                else:
-                    #print(read.query_position)
-                    #print(read.alignment.query_sequence)
-                    base = read.alignment.query_sequence[read.query_position].lower() 
-                    #print("BASE: {}".format(base))
-                    #print(read.alignment.query_sequence)
-                    calls[base] = calls[base] + 1
-                    call_count = call_count + 1
-
-            # compute plurality vote
-            vote_base, plurality_count = getPluralityVoter(calls)
-            #print(vote_base, plurality_count)
-
-
-            # if we end up with zero votes, skip this location
-            if plurality_count < 1:
-                continue
-                
-            # polish bases in mother read
-            read_idx = 0
-            for read in column.pileups:
-
-                # get sub-read direction info
-                read_start, read_end, direction = alignment_interval_dict[read.alignment.query_name]
-
-                # where does this base lie?
-                offset = query_positions[read_idx]            
-
-                # if the sub-read aligns to the mother in the forard direction
-                if direction == 'fwd':
-                    base = vote_base.upper()
-                    # if the sub-read aligns to the reference in the forward
-                    if not read.alignment.is_reverse:
-                        mother_pos = read_start + offset
-                    else:
-                        mother_pos = read_end - 1 - offset
-
-                # if the sub-read aligns to the mother in the reverse direction
-                else:
-                    base = rc(vote_base.upper())
-                    # if the sub-read aligns to the reference in the forward
-                    if not read.alignment.is_reverse:
-                        mother_pos = read_start + offset
-                    # if the sub-read aligns to the reference in the reverse direction
-                    else:
-                        mother_pos = read_end - 1 - offset
-
-                # if we need to polish a deletion, save it and we'll handle it later
-                # if we are a deletion, and the polished base is a deletion, skip/ignore
-                if read.is_del and base != '*':
-                    if len(deletion_removal_list) > 0 and deletion_removal_list[-1][0] == mother_pos:
-                        deletion_removal_list[-1][1].append(base)
-                    else:
-                        deletion_removal_list.append((mother_pos, [base], direction))
-                    #print("Adjusting location {} ({} start + {} offset) in mother read (base {}) from sub-read {} with plural base {}".format(mother_pos, read_start, offset, polished_lamplicon.seq[mother_pos], read_idx, base))
-
-                # polish the base in the mother read
-                else:
-                    
-                    #print("Adjusting location {} ({} start + {} offset) in mother read (base {}) from sub-read {} with plural base {}".format(mother_pos, read_start, offset, polished_lamplicon.seq[mother_pos], read_idx, base))
-
-                    # adjust mother read
-                    polished_lamplicon.seq = polished_lamplicon.seq[:mother_pos] + base + polished_lamplicon.seq[mother_pos + 1:]
-            
-                # cleanup
-                read_idx = read_idx + 1
-
-        # for each deletion, make sure to insert the voted base in the correct
-        # order at the right index. Offsets/coordinates are always in the read direction
-
-        # sort so we add left->right in the mother read
-        deletion_removal_list = sorted(deletion_removal_list)
-        #print(deletion_removal_list)
-
-        # offset counter accounts for inserted bases into the mother read that weren't there before
-        # anytime we insert, we adjust the offset counter
-        offset_counter = 0
-        for position, base_list, direction in deletion_removal_list:
-
-            # if we're a reverse aligned read, deletions are in the opposite order
-            # add in 
-            #  starting at the beginning (reverse end) if there's a run of deletions
-            if direction == 'rev':
-
-                base_list.reverse()
-                for base in base_list:
-
-                    # add 1 to offset because we flipped directions
-                    final_position = position + offset_counter + 1            
-                    polished_lamplicon.seq = polished_lamplicon.seq[:final_position] + base + polished_lamplicon.seq[final_position:]
-                
-                    # update offset counter because we added a base
-                    offset_counter = offset_counter + 1
-
-            # if we're a forward aligned read, add in forward order as encountered
-            else:
-
-                for base in base_list:
-            
-                    final_position = position + offset_counter
-                    polished_lamplicon.seq = polished_lamplicon.seq[:final_position] + base + polished_lamplicon.seq[final_position:]
-                
-                    # update offset counter because we added a base
-                    offset_counter = offset_counter + 1
-                
-            
-        # actually delete any '*' deletions from the polished read
-        polished_lamplicon.seq = Seq(str(polished_lamplicon.seq).replace("*",""))
-        result.polished_seq = polished_lamplicon
+        result.polished_seq = polishLamplicon(lamplicon, subread_alignment_fn, alignment_interval_dict)
 
         ################################################
     
@@ -1199,50 +1199,49 @@ def processLamplicon(sw, process_candidates_path, generate_consensus_path, minim
         result.target_seq_accuracy = (correct_voted_bases, total_voted_bases)
         result.bad_calls = bad_calls
         result.polished_bad_calls = polished_bad_calls
-    
+
+        # update target depth to be aligned target depth
+        result.target_depth = depth
+        
         for alt in target_vcf_record.ALT:
             variant = alt.value.upper()
 
         if args.debug_print:
-            print("  - Found {} reads that cover the target".format(depth))
-            print("  - Pileup result: ",ref, depth, code_string, covers_roi)
+            print("  - Found {} reads that cover the target".format(result.target_depth))
+            print("  - Pileup result: ",ref, result.target_depth, code_string, covers_roi)
 
+            
         # in high confidence mode, ignore pileups that have less than 2 entries
-        if args.high_confidence and depth < 2:
+        if args.high_confidence and result.target_depth < 2:
             #0, 'unknown', 0, 0
             # TODO fix result assignment to zero here
             return result 
-    
-        # if we don't cover the roi, then this was probably a fragment, off target, or spurious
-        # TODO: need to work on these post target failure classifications
-        if not covers_roi:
-            #print("FAILURE!")
-            if within_roi:
-                #print("Failed to align over the target locus, but still within the roi. Diagnosing as fragment.")                       
-                result.classification = 'fragment'
-            else:
-                #print("No idea here.")
-                result.classification = 'spurious'
-            return result
+
+        if result.target_depth > 0:
+            result.classification = 'target'
         
-        # parse code string and set mut/wt counts
-        wt, mut = parsePileupCodeString(code_string, variant)
-        calls = countCallsFromPileup(ref, code_string)
-        plural_base, plural_base_support = getPluralityVoter(calls)
-        #
+            # parse code string and set mut/wt counts
+            wt, mut = parsePileupCodeString(code_string, variant)
+            calls = countCallsFromPileup(ref, code_string)
+            plural_base, plural_base_support = getPluralityVoter(calls)
+            #
 
-        result.plural_base = plural_base
-        result.mut_count = mut
-        result.wt_count = wt
-        result.pileup_str = code_string
-        result.target_depth = depth
+            result.plural_base = plural_base
+            result.mut_count = mut
+            result.wt_count = wt
+            result.pileup_str = code_string
+            result.target_depth = depth
 
-        if args.debug_print:
-            print("  - Found {} mut and {} wt calls".format(result.mut_count, result.wt_count))
-            print("  - Plurality call: {}".format(result.plural_base))
+            if args.debug_print:
+                print("  - Found {} mut and {} wt calls".format(result.mut_count, result.wt_count))
+                print("  - Plurality call: {}".format(result.plural_base))
 
 
-        if result.target_depth == 0
+    #######################################
+    # if we never found an alignable target sequence
+    # attempt to diagnose the issue and classify the read as something other than target
+    if result.target_depth == 0:        
+
         if args.debug_print:
             print("* Didn't find any alignable targets.... diagnosing...")
 
@@ -1323,24 +1322,6 @@ def processLamplicon(sw, process_candidates_path, generate_consensus_path, minim
         # Return the final classification
         return result
 
-
-            
-    # if we don't have any targets after splitting, and aligning
-    if result.target_depth == 0:
-
-        print("WHY!?!?!")
-        exit(1)
-
-        if len(alignments) >= 2:
-            result.classification = 'spurious'
-        elif len(lamplicon.seq) < 60:
-            result.classification = 'short'
-        else:
-            result.classification = 'unknown'
-
-    # if we do cover the roi and have at least one target, we are  target read
-    else:
-        result.classification = 'target'
 
     return result
 
