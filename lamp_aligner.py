@@ -136,10 +136,11 @@ class Result:
     Stores lamplicon classification, pileup info, and other post processing information.
     '''
 
-    def __init__(self, classification='unknown', mut_count=0, wt_count=0, pileup_str='', target_depth=0, alignments=[], seq=None, id=0, timestamp=None):
+    def __init__(self, classification='unknown', mut_count=0, wt_count=0, pileup_str='', target_depth=0, alignments=[], seq=None, idx=0, read_id = '', timestamp=None):
         self.classification = classification
         self.mut_count = mut_count
         self.wt_count = wt_count
+        self.plural_base = ''
         self.pileup_str = pileup_str
         self.target_depth = target_depth
         self.target_seq_accuracy = (0,0)
@@ -148,7 +149,8 @@ class Result:
         self.alignments = alignments
         self.seq = seq
         self.polished_seq = None
-        self.id = id
+        self.idx = idx
+        self.read_id = read_id
         self.timestamp = timestamp
 
     def __lt__(self, other):
@@ -667,7 +669,7 @@ def parsePileupCodeString(code_string, variant):
 
         if c == ',' or c == '.':
             ref_count = ref_count + 1
-
+            
         elif c == variant or c == variant.lower():
             variant_count = variant_count + 1
 
@@ -826,7 +828,11 @@ def proportionConfidenceInterval(mut, wt, conf):
                                            nobs=mut+wt,
                                            alpha=(1 - conf))
 
-    samp_mean = float(mut)/float(mut + wt) * 100.0
+    if (mut + wt) > 0:
+        samp_mean = float(mut)/float(mut + wt) * 100.0
+    else:
+        samp_mean = 0.0
+        
     if conf_int[0] == 0.0:
         low = 0.0
     else:
@@ -887,6 +893,7 @@ def timestampDelta(start, end):
     delta = end - start
     return delta.total_seconds()
 
+
 ################################################
 def processLamplicon(sw, process_candidates_path, generate_consensus_path, minimap2, lamp_idx, lamplicon, primers, ref_vcf_record, target_vcf_record, args):
 
@@ -924,7 +931,7 @@ def processLamplicon(sw, process_candidates_path, generate_consensus_path, minim
             num_ont_seqs = num_ont_seqs + 1
 
     # if high confidence mode, only proceed if there are 2+ targets
-    if args.high_confidence and num_targets < 2:
+    if args.high_confidence and result.target_depth < 2:
         return Result(target_depth=0, classification='unknown', mut_count=0, wt_count=0, pileup_str='')
 
     # low alignment coverage indicates this may be a genomic read
@@ -951,10 +958,293 @@ def processLamplicon(sw, process_candidates_path, generate_consensus_path, minim
                 
     # if there were no targets identified over the threshold
     # classify the read
-    if result.target_depth == 0:        
+    if result.target_depth > 0:
+
+        ####################################
+        # if we found a target....
+
+        # extend each target into a single amplicon and emit as fasta
+        target_idx = 0
+        targets = []
+        alignment_intervals = list()
+        alignment_interval_dict = dict()
+        for alignment in alignments:
+
+            if alignment.primer_name == 'T' or alignment.primer_name == 'Tc':
+        
+                # extend sequence around target for better mapping
+                seq_start, seq_end = extractAmpliconAroundTarget(primers, alignments, alignment)
+        
+                # if we get a -1 for seq end, we never matched to the right, 
+                # so just grab the whole read
+                if seq_end == -1:
+                    seq_end = len(lamplicon.seq) - 1
+
+                subread_id = "{}_{}".format(lamp_idx, target_idx)
+                if alignment.primer_name == 'T':
+                    direction = 'fwd'
+                else:
+                    direction = 'rev'
+                alignment_intervals.append((seq_start, seq_end, subread_id))
+                alignment_interval_dict[subread_id] = (seq_start, seq_end, direction)
+            
+                # generate new read from lamplicon.seq substring
+                record = SeqRecord(
+                    lamplicon.seq[seq_start:seq_end],
+                    subread_id,
+                    subread_id,
+                    "lamplicon {} target {}".format(lamp_idx, target_idx)
+                )
+
+                targets.append(record)
+                target_idx += 1
+
+        # Print intervals
+        if args.debug_print:
+            print("* Found {} candidate sub-reads at intervals:".format(len(alignment_intervals)))
+            for interval in alignment_intervals:
+                print(interval)
+            print("", flush=True)
+          
+        # write separated targets to new FASTA file
+        fasta_fn = "{}/{}.fasta".format(args.output_dir, lamp_idx)
+        with open(fasta_fn, "w") as output_handle:
+            SeqIO.write(targets, output_handle, "fasta")
+
+
+        ##################################################################
+        #  STAGE 2: Map each sub-read against a smaller target reference #
+        ##################################################################
+        # map each sub read to the target sequence; ignore secondary mappings 
+        if args.debug_print:
+            print("* Aligning candidate sub-reads...")
+        out_sam_all = "{}/{}_all.sam".format(args.output_dir, lamp_idx)
+        out_bam = "{}/{}_all.bam".format(args.output_dir, lamp_idx)
+        subprocess.run([process_candidates_path, fasta_fn, out_sam_all, args.target_ref_fn], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+        # output pileup generated by process_candidates.sh
+        pileup_fn = "{}/{}.pileup".format(args.output_dir, lamp_idx)
+
+
+        ###############################
+        #  Polish orig read and emit  #
+        ###############################
+        # generate new read from lamplicon.seq substring
+        polished_lamplicon = SeqRecord(lamplicon.seq,
+                                       id = lamplicon.id,
+                                       name = lamplicon.name,
+                                       description = lamplicon.description
+        )
+
+    
+        # ignore this pileup and parse the samfile into pysam
+        pileup_alignments = pysam.AlignmentFile(out_bam, "r")
+
+        # generate pileup over target region
+        pileup_iter = pileup_alignments.pileup(truncate=True,
+                                               stepper="samtools",
+                                               min_base_quality=0,
+                                               ignore_overlaps=False,
+                                               ignore_orphans=False)
+
+        deletion_removal_list = list()
+    
+        # iterate over the pileup
+        deletion_streak_counters = dict()
+
+        # for each pileup position
+        for column in pileup_iter:
+
+            calls = dict({'a' : 0, 't' : 0, 'c' : 0, 'g' : 0, '*' : 0, 'ref' : 0})
+            call_count = 0
+
+            # get the position in the sub-read for this column
+            # NOTE: deletions return the location "before" the deletion position in the alignment
+            query_positions = column.get_query_positions()
+                
+            # gather all votes and positions in mother read
+            for read in column.pileups:
+            
+                # deletion
+                if read.is_del:
+                    calls['*'] = calls['*'] + 1
+                    call_count = call_count + 1
+                # insertion (skip)
+                elif read.is_refskip:
+                    continue
+                # mismatch
+                else:
+                    #print(read.query_position)
+                    #print(read.alignment.query_sequence)
+                    base = read.alignment.query_sequence[read.query_position].lower() 
+                    #print("BASE: {}".format(base))
+                    #print(read.alignment.query_sequence)
+                    calls[base] = calls[base] + 1
+                    call_count = call_count + 1
+
+            # compute plurality vote
+            vote_base, plurality_count = getPluralityVoter(calls)
+            #print(vote_base, plurality_count)
+
+
+            # if we end up with zero votes, skip this location
+            if plurality_count < 1:
+                continue
+                
+            # polish bases in mother read
+            read_idx = 0
+            for read in column.pileups:
+
+                # get sub-read direction info
+                read_start, read_end, direction = alignment_interval_dict[read.alignment.query_name]
+
+                # where does this base lie?
+                offset = query_positions[read_idx]            
+
+                # if the sub-read aligns to the mother in the forard direction
+                if direction == 'fwd':
+                    base = vote_base.upper()
+                    # if the sub-read aligns to the reference in the forward
+                    if not read.alignment.is_reverse:
+                        mother_pos = read_start + offset
+                    else:
+                        mother_pos = read_end - 1 - offset
+
+                # if the sub-read aligns to the mother in the reverse direction
+                else:
+                    base = rc(vote_base.upper())
+                    # if the sub-read aligns to the reference in the forward
+                    if not read.alignment.is_reverse:
+                        mother_pos = read_start + offset
+                    # if the sub-read aligns to the reference in the reverse direction
+                    else:
+                        mother_pos = read_end - 1 - offset
+
+                # if we need to polish a deletion, save it and we'll handle it later
+                # if we are a deletion, and the polished base is a deletion, skip/ignore
+                if read.is_del and base != '*':
+                    if len(deletion_removal_list) > 0 and deletion_removal_list[-1][0] == mother_pos:
+                        deletion_removal_list[-1][1].append(base)
+                    else:
+                        deletion_removal_list.append((mother_pos, [base], direction))
+                    #print("Adjusting location {} ({} start + {} offset) in mother read (base {}) from sub-read {} with plural base {}".format(mother_pos, read_start, offset, polished_lamplicon.seq[mother_pos], read_idx, base))
+
+                # polish the base in the mother read
+                else:
+                    
+                    #print("Adjusting location {} ({} start + {} offset) in mother read (base {}) from sub-read {} with plural base {}".format(mother_pos, read_start, offset, polished_lamplicon.seq[mother_pos], read_idx, base))
+
+                    # adjust mother read
+                    polished_lamplicon.seq = polished_lamplicon.seq[:mother_pos] + base + polished_lamplicon.seq[mother_pos + 1:]
+            
+                # cleanup
+                read_idx = read_idx + 1
+
+        # for each deletion, make sure to insert the voted base in the correct
+        # order at the right index. Offsets/coordinates are always in the read direction
+
+        # sort so we add left->right in the mother read
+        deletion_removal_list = sorted(deletion_removal_list)
+        #print(deletion_removal_list)
+
+        # offset counter accounts for inserted bases into the mother read that weren't there before
+        # anytime we insert, we adjust the offset counter
+        offset_counter = 0
+        for position, base_list, direction in deletion_removal_list:
+
+            # if we're a reverse aligned read, deletions are in the opposite order
+            # add in 
+            #  starting at the beginning (reverse end) if there's a run of deletions
+            if direction == 'rev':
+
+                base_list.reverse()
+                for base in base_list:
+
+                    # add 1 to offset because we flipped directions
+                    final_position = position + offset_counter + 1            
+                    polished_lamplicon.seq = polished_lamplicon.seq[:final_position] + base + polished_lamplicon.seq[final_position:]
+                
+                    # update offset counter because we added a base
+                    offset_counter = offset_counter + 1
+
+            # if we're a forward aligned read, add in forward order as encountered
+            else:
+
+                for base in base_list:
+            
+                    final_position = position + offset_counter
+                    polished_lamplicon.seq = polished_lamplicon.seq[:final_position] + base + polished_lamplicon.seq[final_position:]
+                
+                    # update offset counter because we added a base
+                    offset_counter = offset_counter + 1
+                
+            
+        # actually delete any '*' deletions from the polished read
+        polished_lamplicon.seq = Seq(str(polished_lamplicon.seq).replace("*",""))
+        result.polished_seq = polished_lamplicon
+
+        ################################################
+    
+        # extract pileup info
+        limit = 1000
+        ref, depth, code_string, covers_roi, within_roi, correct_voted_bases, total_voted_bases, bad_calls, polished_bad_calls = extractPileupInfo(pileup_fn, target_vcf_record.CHROM, target_vcf_record.POS, limit)
+
+    
+        # 
+        #if total_voted_bases > 0:
+        #    print("************** {}/{} {}%".format(correct_voted_bases, total_voted_bases, float(correct_voted_bases)/float(total_voted_bases) * 100.0))
+        #else:
+        #    print("************** {}/{} {}%".format(correct_voted_bases, 0, "NA"))
+
+        result.target_seq_accuracy = (correct_voted_bases, total_voted_bases)
+        result.bad_calls = bad_calls
+        result.polished_bad_calls = polished_bad_calls
+    
+        for alt in target_vcf_record.ALT:
+            variant = alt.value.upper()
 
         if args.debug_print:
-            print("* Didn't find any targets.... diagnosing...")
+            print("  - Found {} reads that cover the target".format(depth))
+            print("  - Pileup result: ",ref, depth, code_string, covers_roi)
+
+        # in high confidence mode, ignore pileups that have less than 2 entries
+        if args.high_confidence and depth < 2:
+            #0, 'unknown', 0, 0
+            # TODO fix result assignment to zero here
+            return result 
+    
+        # if we don't cover the roi, then this was probably a fragment, off target, or spurious
+        # TODO: need to work on these post target failure classifications
+        if not covers_roi:
+            #print("FAILURE!")
+            if within_roi:
+                #print("Failed to align over the target locus, but still within the roi. Diagnosing as fragment.")                       
+                result.classification = 'fragment'
+            else:
+                #print("No idea here.")
+                result.classification = 'spurious'
+            return result
+        
+        # parse code string and set mut/wt counts
+        wt, mut = parsePileupCodeString(code_string, variant)
+        calls = countCallsFromPileup(ref, code_string)
+        plural_base, plural_base_support = getPluralityVoter(calls)
+        #
+
+        result.plural_base = plural_base
+        result.mut_count = mut
+        result.wt_count = wt
+        result.pileup_str = code_string
+        result.target_depth = depth
+
+        if args.debug_print:
+            print("  - Found {} mut and {} wt calls".format(result.mut_count, result.wt_count))
+            print("  - Plurality call: {}".format(result.plural_base))
+
+
+        if result.target_depth == 0
+        if args.debug_print:
+            print("* Didn't find any alignable targets.... diagnosing...")
 
         # this is maybe a background genomic read or a lamplicon "fragment"
         # fragments occur due to fragmentation-based library prep or shearing
@@ -972,10 +1262,14 @@ def processLamplicon(sw, process_candidates_path, generate_consensus_path, minim
             # if the hit is within fragment_limit of the target, mark it as a fragment
             if is_hit_near_target(hit, ref_vcf_record, fragment_limit):
                 result.classification = 'fragment'
+                if args.debug_print:
+                    print(" - Hit is near the target region but does not contain target. Diagnosing as fragment.")
                 return result
             
             # else, just mark it as background
             result.classification = 'background'
+            if args.debug_print:
+                print(" - Hit is not near target. Diagnosing as background.")
             return result
 
         
@@ -984,13 +1278,22 @@ def processLamplicon(sw, process_candidates_path, generate_consensus_path, minim
 
             # get coverage
             if alignment_coverage >= 0.15:
+                if args.debug_print:
+                    print(" - ONT seqs dominate alignments. Diagnosing as ONT")
+                
                 result.classification = 'ont'
             else:
                 # assume unknown
+                if args.debug_print:
+                    print(" - Diagnosing as unknown.")
+
                 result.classification = 'unknown'
 
                 # try to align the read to see if it's a background genomic read
                 for hit in minimap2.map(lamplicon.seq):
+                    if args.debug_print:
+                        print(" - Read actually maps. Adjusting diagnosis to background.")
+
                     result.classification = 'background'
 
             return result
@@ -998,291 +1301,30 @@ def processLamplicon(sw, process_candidates_path, generate_consensus_path, minim
             
         # classify the read as spurious (bad/erroneous primer amplification) if it has at least 3 primer sequences, didn't align at the locus, and no target
         if len(alignments) >= 3:
+            if args.debug_print:
+                print(" - Diagnosing as spurious.")
+
             result.classification = 'spurious'
             return result
 
         # suspiciously short sequences might just be a fragment that can't align with enough identity
         if len(lamplicon.seq) < 60:
+            if args.debug_print:
+                print(" - Diagnosing as short.")
+
             result.classification = 'short'
         else:
+            if args.debug_print:
+                print(" - Diagnosing as unknown.")
+
             # final default to unknown
             result.classification = 'unknown'
 
         # Return the final classification
         return result
 
-    ####################################
-    # if we found a target....
 
-    # extend each target into a single amplicon and emit as fasta
-    target_idx = 0
-    targets = []
-    alignment_intervals = list()
-    alignment_interval_dict = dict()
-    for alignment in alignments:
-
-        if alignment.primer_name == 'T' or alignment.primer_name == 'Tc':
-        
-            # extend sequence around target for better mapping
-            seq_start, seq_end = extractAmpliconAroundTarget(primers, alignments, alignment)
-        
-            # if we get a -1 for seq end, we never matched to the right, 
-            # so just grab the whole read
-            if seq_end == -1:
-                seq_end = len(lamplicon.seq) - 1
-
-            subread_id = "{}_{}".format(lamp_idx, target_idx)
-            if alignment.primer_name == 'T':
-                direction = 'fwd'
-            else:
-                direction = 'rev'
-            alignment_intervals.append((seq_start, seq_end, subread_id))
-            alignment_interval_dict[subread_id] = (seq_start, seq_end, direction)
             
-            # generate new read from lamplicon.seq substring
-            record = SeqRecord(
-                lamplicon.seq[seq_start:seq_end],
-                subread_id,
-                subread_id,
-                "lamplicon {} target {}".format(lamp_idx, target_idx)
-            )
-
-            targets.append(record)
-            target_idx += 1
-
-    # Print intervals
-    if args.debug_print:
-        print("* Found {} candidate sub-reads at intervals:".format(len(alignment_intervals)))
-        for interval in alignment_intervals:
-            print(interval)
-        print("", flush=True)
-          
-    # write separated targets to new FASTA file
-    fasta_fn = "{}/{}.fasta".format(args.output_dir, lamp_idx)
-    with open(fasta_fn, "w") as output_handle:
-        SeqIO.write(targets, output_handle, "fasta")
-
-
-    ##################################################################
-    #  STAGE 2: Map each sub-read against a smaller target reference #
-    ##################################################################
-    # map each sub read to the target sequence; ignore secondary mappings 
-    if args.debug_print:
-        print("* Aligning candidate sub-reads...")
-    out_sam_all = "{}/{}_all.sam".format(args.output_dir, lamp_idx)
-    out_bam = "{}/{}_all.bam".format(args.output_dir, lamp_idx)
-    subprocess.run([process_candidates_path, fasta_fn, out_sam_all, args.target_ref_fn], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-
-    # output pileup generated by process_candidates.sh
-    pileup_fn = "{}/{}.pileup".format(args.output_dir, lamp_idx)
-
-
-    ###############################
-    #  Polish orig read and emit  #
-    ###############################
-    # generate new read from lamplicon.seq substring
-    polished_lamplicon = SeqRecord(lamplicon.seq,
-                                   id = lamplicon.id,
-                                   name = lamplicon.name,
-                                   description = lamplicon.description
-    )
-
-    
-    # ignore this pileup and parse the samfile into pysam
-    pileup_alignments = pysam.AlignmentFile(out_bam, "r")
-
-    # generate pileup over target region
-    pileup_iter = pileup_alignments.pileup(truncate=True,
-                                           stepper="samtools",
-                                           min_base_quality=0,
-                                           ignore_overlaps=False,
-                                           ignore_orphans=False)
-
-    deletion_removal_list = list()
-    
-    # iterate over the pileup
-    deletion_streak_counters = dict()
-
-    # for each pileup position
-    for column in pileup_iter:
-
-        calls = dict({'a' : 0, 't' : 0, 'c' : 0, 'g' : 0, '*' : 0, 'ref' : 0})
-        call_count = 0
-
-        # get the position in the sub-read for this column
-        # NOTE: deletions return the location "before" the deletion position in the alignment
-        query_positions = column.get_query_positions()
-                
-        # gather all votes and positions in mother read
-        for read in column.pileups:
-            
-            # deletion
-            if read.is_del:
-                calls['*'] = calls['*'] + 1
-                call_count = call_count + 1
-            # insertion (skip)
-            elif read.is_refskip:
-                continue
-            # mismatch
-            else:
-                #print(read.query_position)
-                #print(read.alignment.query_sequence)
-                base = read.alignment.query_sequence[read.query_position].lower() 
-                #print("BASE: {}".format(base))
-                #print(read.alignment.query_sequence)
-                calls[base] = calls[base] + 1
-                call_count = call_count + 1
-
-        # compute plurality vote
-        vote_base, plurality_count = getPluralityVoter(calls)
-        #print(vote_base, plurality_count)
-
-
-        # if we end up with zero votes, skip this location
-        if plurality_count < 1:
-            continue
-                
-        # polish bases in mother read
-        read_idx = 0
-        for read in column.pileups:
-
-            # get sub-read direction info
-            read_start, read_end, direction = alignment_interval_dict[read.alignment.query_name]
-
-            # where does this base lie?
-            offset = query_positions[read_idx]            
-
-            # if the sub-read aligns to the mother in the forard direction
-            if direction == 'fwd':
-                base = vote_base.upper()
-                # if the sub-read aligns to the reference in the forward
-                if not read.alignment.is_reverse:
-                    mother_pos = read_start + offset
-                else:
-                    mother_pos = read_end - 1 - offset
-
-            # if the sub-read aligns to the mother in the reverse direction
-            else:
-                base = rc(vote_base.upper())
-                # if the sub-read aligns to the reference in the forward
-                if not read.alignment.is_reverse:
-                    mother_pos = read_start + offset
-                # if the sub-read aligns to the reference in the reverse direction
-                else:
-                    mother_pos = read_end - 1 - offset
-
-            # if we need to polish a deletion, save it and we'll handle it later
-            # if we are a deletion, and the polished base is a deletion, skip/ignore
-            if read.is_del and base != '*':
-                if len(deletion_removal_list) > 0 and deletion_removal_list[-1][0] == mother_pos:
-                    deletion_removal_list[-1][1].append(base)
-                else:
-                    deletion_removal_list.append((mother_pos, [base], direction))
-                #print("Adjusting location {} ({} start + {} offset) in mother read (base {}) from sub-read {} with plural base {}".format(mother_pos, read_start, offset, polished_lamplicon.seq[mother_pos], read_idx, base))
-
-            # polish the base in the mother read
-            else:
-                    
-                #print("Adjusting location {} ({} start + {} offset) in mother read (base {}) from sub-read {} with plural base {}".format(mother_pos, read_start, offset, polished_lamplicon.seq[mother_pos], read_idx, base))
-
-                # adjust mother read
-                polished_lamplicon.seq = polished_lamplicon.seq[:mother_pos] + base + polished_lamplicon.seq[mother_pos + 1:]
-            
-            # cleanup
-            read_idx = read_idx + 1
-
-    # for each deletion, make sure to insert the voted base in the correct
-    # order at the right index. Offsets/coordinates are always in the read direction
-
-    # sort so we add left->right in the mother read
-    deletion_removal_list = sorted(deletion_removal_list)
-    #print(deletion_removal_list)
-
-    # offset counter accounts for inserted bases into the mother read that weren't there before
-    # anytime we insert, we adjust the offset counter
-    offset_counter = 0
-    for position, base_list, direction in deletion_removal_list:
-
-        # if we're a reverse aligned read, deletions are in the opposite order
-        # add in 
-        #  starting at the beginning (reverse end) if there's a run of deletions
-        if direction == 'rev':
-
-            base_list.reverse()
-            for base in base_list:
-
-                # add 1 to offset because we flipped directions
-                final_position = position + offset_counter + 1            
-                polished_lamplicon.seq = polished_lamplicon.seq[:final_position] + base + polished_lamplicon.seq[final_position:]
-                
-                # update offset counter because we added a base
-                offset_counter = offset_counter + 1
-
-        # if we're a forward aligned read, add in forward order as encountered
-        else:
-
-            for base in base_list:
-            
-                final_position = position + offset_counter
-                polished_lamplicon.seq = polished_lamplicon.seq[:final_position] + base + polished_lamplicon.seq[final_position:]
-                
-                # update offset counter because we added a base
-                offset_counter = offset_counter + 1
-                
-            
-    # actually delete any '*' deletions from the polished read
-    polished_lamplicon.seq = Seq(str(polished_lamplicon.seq).replace("*",""))
-    result.polished_seq = polished_lamplicon
-
-    ################################################
-    
-    # extract pileup info
-    limit = 1000
-    ref, depth, code_string, covers_roi, within_roi, correct_voted_bases, total_voted_bases, bad_calls, polished_bad_calls = extractPileupInfo(pileup_fn, target_vcf_record.CHROM, target_vcf_record.POS, limit)
-
-    
-    # 
-    #if total_voted_bases > 0:
-    #    print("************** {}/{} {}%".format(correct_voted_bases, total_voted_bases, float(correct_voted_bases)/float(total_voted_bases) * 100.0))
-    #else:
-    #    print("************** {}/{} {}%".format(correct_voted_bases, 0, "NA"))
-
-    result.target_seq_accuracy = (correct_voted_bases, total_voted_bases)
-    result.bad_calls = bad_calls
-    result.polished_bad_calls = polished_bad_calls
-    
-    for alt in target_vcf_record.ALT:
-        variant = alt.value.upper()
-
-    if args.debug_print:
-        print("  - Found {} reads that cover the target".format(depth))
-        print("  - Pileup result: ",ref, depth, code_string, covers_roi)
-
-    # in high confidence mode, ignore pileups that have less than 2 entries
-    if args.high_confidence and depth < 2:
-        #0, 'unknown', 0, 0
-        # TODO fix result assignment to zero here
-        return result 
-    
-    # if we don't cover the roi, then this was probably a fragment, off target, or spurious
-    if not covers_roi:
-        if within_roi:
-            result.classification = 'fragment'
-        else:
-            result.classification = 'spurious'
-        return result
-        
-    # parse code string and set mut/wt counts
-    wt, mut = parsePileupCodeString(code_string, variant)
-    result.mut_count = mut
-    result.wt_count = wt
-    result.pileup_str = code_string
-    result.target_depth = depth
-
-    if args.debug_print:
-        print("  - Found {} mut and {} wt calls".format(result.mut_count, result.wt_count))
-            
-
     # if we don't have any targets after splitting, and aligning
     if result.target_depth == 0:
 
@@ -1354,7 +1396,8 @@ def processLamplicons(args, primers, ref_vcf_record, target_vcf_record, lamplico
                                   args);
 
         # add to list of results
-        result.id = lamp_idx
+        result.read_id = lamplicon.name
+        result.idx = lamp_idx
         result.timestamp = timestamp
         results.append(result)
 
@@ -1456,7 +1499,8 @@ def main(args):
     num_targets_map = dict()
     all_bad_calls = dict({'a' : 0, 't' : 0, 'c' : 0, 'g' : 0, '*' : 0, 'ref' : 0})
     all_polished_bad_calls = dict({'a' : 0, 't' : 0, 'c' : 0, 'g' : 0, '*' : 0, 'ref' : 0})
-
+    plural_target_calls = dict({'a' : 0, 't' : 0, 'c' : 0, 'g' : 0, '*' : 0, 'ref' : 0})
+    
     polished_lamplicons = list()
     
     total_correct_calls = 0
@@ -1485,7 +1529,9 @@ def main(args):
             if float(result.wt_count)/float(result.target_depth) > 0.5:
                 wt_count = wt_count + 1
 
-
+        if result.plural_base.lower() in plural_target_calls.keys():
+            plural_target_calls[result.plural_base.lower()] = plural_target_calls[result.plural_base.lower()] + 1
+                
         total_correct_calls = total_correct_calls + result.target_seq_accuracy[0]
         total_calls = total_calls + result.target_seq_accuracy[1]
 
@@ -1508,10 +1554,11 @@ def main(args):
         else:
             polished_lamplicons.append(result.seq)
         #
+        err = 0.015
         if mut_count + wt_count > 0:
             
             # confidence intervals
-            err = 0.015
+    
             conf = 0.95
         
             if isStatisticallySignificant(mut_count, wt_count, conf, err) and (conf not in statistical_significance_map.keys()):
@@ -1530,7 +1577,19 @@ def main(args):
                 statistical_significance_map[conf] = time_ordered_index + 1
 
         time_ordered_index = time_ordered_index + 1
-            
+
+    # save read classifications
+    if args.save_read_classifications:
+        read_classification_list = list()
+        for result in results:
+            read_classification_list.append((result.read_id, result.classification, result.plural_base))
+
+
+        #print(read_classification_list)
+        class_fn = "{}/lamprey_read_classifications.csv".format(args.output_dir)
+        with open(class_fn, 'w') as filehandle:
+            filehandle.writelines("{},{},{}\n".format(read_id,classification,plural_base) for read_id,classification,plural_base in read_classification_list)
+        
     # Summary results
     low, samp_mean, high = proportionConfidenceInterval(mut_count, wt_count, 0.95)
         
@@ -1542,7 +1601,13 @@ def main(args):
     print(" Target Fraction: {:.2f}%".format(float(target_counter)/float(len(lamplicons)) * 100.0))
     print(" Classifications: ")
     print(classification_counters)
-    print(" VAF: {:.2f}% ({}/{})".format(float(mut_count)/float(mut_count + wt_count) * 100.0, mut_count, (mut_count + wt_count)))
+    if mut_count + wt_count > 0:
+        VAF = float(mut_count)/float(mut_count + wt_count) * 100.0
+    else:
+        VAF = 0.0
+    
+    print(" VAF: {:.2f}% ({}/{})".format(VAF, mut_count, (mut_count + wt_count)))
+    print(" plural target calls:", plural_target_calls)
     low, samp_mean, high = proportionConfidenceInterval(mut_count, wt_count, 0.95)
     print("   95%    CI: {:.2f}% -- {:.2f}%".format(low * 100.0, high * 100.0))
     low, samp_mean, high = proportionConfidenceInterval(mut_count, wt_count, 0.99)
@@ -1552,6 +1617,7 @@ def main(args):
     low, samp_mean, high = proportionConfidenceInterval(mut_count, wt_count, 0.9999)
     print("   99.99% CI: {:.2f}% -- {:.2f}%".format(low * 100.0, high * 100.0))
 
+    
     print("   Read # when variant call statistically significant vs. {}% error: ".format(err * 100.0), statistical_significance_map)
 
 
@@ -1577,13 +1643,17 @@ def main(args):
     # Write output files
     # polished lamplicons
     fasta_fn = "{}/polished.fasta".format(args.output_dir)
-    with open(fasta_fn, "w") as output_handle:
-        SeqIO.write(polished_lamplicons, output_handle, "fasta")
+    #TODO: Nonetypes gett added to the polished list sometimes....
+    if len(polished_lamplicons) > 0:
+        with open(fasta_fn, "w") as output_handle:
+            SeqIO.write(polished_lamplicons, output_handle, "fasta")
 
 
     
 def argparser():
     parser = argparse.ArgumentParser()
+
+    # input/output files
     parser.add_argument("target_ref_fn")
     parser.add_argument("human_ref_fn")
     parser.add_argument("primer_set_fn")
@@ -1591,17 +1661,27 @@ def argparser():
     parser.add_argument("--output_dir", type=str, default="results")
     parser.add_argument("--target_vcf_fn", type=str, default='')
     parser.add_argument("--ref_vcf_fn", type=str, default='')
-    parser.add_argument("--max_lamplicons", type=int, default=-1)
-    parser.add_argument("--threshold", type=float, default=0.80,
+
+    # algorithm options
+    parser.add_argument("--threshold", type=float, default=0.75,
             help="Primer identity threshold for successful alignment")
-    parser.add_argument("--debug_print", action="store_true", default=False)
-    parser.add_argument("--save_target_reads", action="store_true", default=False)
-    #parser.add_argument("--skip_consensus_polishing", action="store_true", default=False)
-    parser.add_argument("--print_summary_stats", action="store_true", default=False)
-    parser.add_argument("--save_concatemers", action="store_true", default=False)
-    parser.add_argument("--high_confidence", action="store_true", default=False)
-    parser.add_argument("--num_threads", type=int, default=1)
     parser.add_argument("--time_sort", action="store_true", default=False)
+    parser.add_argument("--high_confidence", action="store_true", default=False)
+    
+    # run options
+    parser.add_argument("--num_threads", type=int, default=1)
+    
+    # print options
+    parser.add_argument("--debug_print", action="store_true", default=False)
+    parser.add_argument("--print_summary_stats", action="store_true", default=False)
+    
+    # output options
+    parser.add_argument("--save_target_reads", action="store_true", default=False)
+    parser.add_argument("--save_concatemers", action="store_true", default=False)
+    parser.add_argument("--save_read_classifications", action="store_true", default=False)
+
+
+    
     
     return parser
 
