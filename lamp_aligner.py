@@ -1,5 +1,4 @@
 #!/usr/bin/python
-
 import sys, os, subprocess, argparse, collections
 import random
 import heapq
@@ -1073,7 +1072,6 @@ def processLamplicon(sw, process_candidates_path, generate_consensus_path, minim
         printPrimerAlignments(lamplicon.seq, alignments)
 
     # does this lamplicon possibly cover the target?
-    num_targets = 0
     num_ont_seqs = 0
 
     for alignment in alignments:
@@ -1088,27 +1086,6 @@ def processLamplicon(sw, process_candidates_path, generate_consensus_path, minim
     if args.high_confidence and result.target_depth < 2:
         return Result(target_depth=0, classification='unknown', mut_count=0, wt_count=0, pileup_str='')
 
-    # low alignment coverage indicates this may be a genomic read
-    if alignment_coverage < 0.15:
-        if args.debug_print:
-            print("* Low alignment coverage. Suspected genomic read. Aligning to human ref...")
-        for hit in minimap2.map(lamplicon.seq):
-            if args.debug_print:
-                print(hit)
-            
-            # skip non-primary alignments
-            if not hit.is_primary:
-                continue
-            
-            # if the hit is within fragment_limit of the target, mark it as a fragment
-            if not is_hit_near_target(hit, ref_vcf_record, fragment_limit):
-                if args.debug_print:
-                    print("  - Alignment not near reference target. Assuming background genomic read.")
-                result.classification = 'background'
-                return result
-
-        if args.debug_print:
-            print("  - Could not confirm genomic read, diagnosing further...")
                 
     ####################################
     # if we found a suspected target seed
@@ -1240,11 +1217,12 @@ def processLamplicon(sw, process_candidates_path, generate_consensus_path, minim
 
         if args.debug_print:
             print("* Didn't find any alignable targets.... diagnosing...")
-
+            print(" - Attempting to align to reference genome...")
         # this is maybe a background genomic read or a lamplicon "fragment"
         # fragments occur due to fragmentation-based library prep or shearing
         # try to align the read to see if it's a background genomic read
         # if we have any hits, classify as background
+        
         for hit in minimap2.map(lamplicon.seq):
 
             if args.debug_print:
@@ -1267,7 +1245,9 @@ def processLamplicon(sw, process_candidates_path, generate_consensus_path, minim
                 print(" - Hit is not near target. Diagnosing as background.")
             return result
 
-        
+        if args.debug_print:
+            print(" - Could not find a genomic hit...")
+            
         # classify read as "ont" if it contains > 1 ONT sequence and fewer than 2 other suspected primer seqs and greater than 50% coverage
         if num_ont_seqs > 0 and (len(alignments) - 2) <= num_ont_seqs :
 
@@ -1452,6 +1432,7 @@ def main(args):
 
     # collect results
     # priority queue will sort based on timestamp
+    # reads will always have a timestamp set to 0 if time_sort flag is not set
     if not args.debug_print:
         for i in progressbar(range(len(lamplicons))):
             heapq.heappush(results, q.get(True))
@@ -1467,6 +1448,9 @@ def main(args):
     print("> Finished processing all reads.")
         
     # process results
+    if args.time_sort:
+        results.sort()
+    
     classification_counters = dict({'target' : 0, 'fragment' : 0, 'background' : 0, 'ont' : 0, 'spurious' : 0, 'short' : 0, 'unknown' : 0})
     target_counter = 0
     mut_count = 0
@@ -1477,6 +1461,8 @@ def main(args):
     all_bad_calls = dict({'a' : 0, 't' : 0, 'c' : 0, 'g' : 0, '*' : 0, 'ref' : 0})
     all_polished_bad_calls = dict({'a' : 0, 't' : 0, 'c' : 0, 'g' : 0, '*' : 0, 'ref' : 0})
     plural_target_calls = dict({'a' : 0, 't' : 0, 'c' : 0, 'g' : 0, '*' : 0, 'ref' : 0})
+    plural_mut_count = 0
+    plural_wt_calls = 0
     
     polished_lamplicons = list()
     
@@ -1508,7 +1494,7 @@ def main(args):
 
         if result.plural_base.lower() in plural_target_calls.keys():
             plural_target_calls[result.plural_base.lower()] = plural_target_calls[result.plural_base.lower()] + 1
-                
+                        
         total_correct_calls = total_correct_calls + result.target_seq_accuracy[0]
         total_calls = total_calls + result.target_seq_accuracy[1]
 
@@ -1555,68 +1541,101 @@ def main(args):
 
         time_ordered_index = time_ordered_index + 1
 
-    # save read classifications
-    if args.save_read_classifications:
-        read_classification_list = list()
-        for result in results:
-            read_classification_list.append((result.read_id, result.classification, result.plural_base))
-
-
-        #print(read_classification_list)
-        class_fn = "{}/lamprey_read_classifications.csv".format(args.output_dir)
-        with open(class_fn, 'w') as filehandle:
-            filehandle.writelines("{},{},{}\n".format(read_id,classification,plural_base) for read_id,classification,plural_base in read_classification_list)
         
     # Summary results
     low, samp_mean, high = proportionConfidenceInterval(mut_count, wt_count, 0.95)
         
     # print results
-    print("")
-    print("|---------------------|")
-    print("|   Summary Results   |")
-    print("|---------------------|")
-    print(" Target Fraction: {:.2f}%".format(float(target_counter)/float(len(lamplicons)) * 100.0))
-    print(" Classifications: ")
-    print(classification_counters)
+    s = ""
+    s += "|---------------------|\n"
+    s += "|   Summary Results   |\n"
+    s += "|---------------------|\n"
+    s += " Target Fraction: {:.2f}%\n".format(float(target_counter)/float(len(lamplicons)) * 100.0)
+    s += " Classifications: "
+    s += str(classification_counters) + "\n"
+
+    # VAF calculations
+    mut_base = ''
+    for alt in target_vcf_record.ALT:
+        mut_base = alt.value.lower()
+    wt_base = target_vcf_record.REF.lower()
+
+    
     if mut_count + wt_count > 0:
         VAF = float(mut_count)/float(mut_count + wt_count) * 100.0
     else:
         VAF = 0.0
-    
-    print(" VAF: {:.2f}% ({}/{})".format(VAF, mut_count, (mut_count + wt_count)))
-    print(" plural target calls:", plural_target_calls)
+
+    plural_mut_count = plural_target_calls[mut_base]
+    plural_wt_count = plural_target_calls[wt_base]
+
+    if plural_mut_count + plural_wt_count > 0:
+        plural_VAF = float(plural_mut_count)/float(plural_mut_count + plural_wt_count) * 100.0
+    else:
+        plural_VAF = 0.0
+
+    #plural_mut_count = plural_target_calls[
+        
+    s += " Majority VAF: {:.2f}% ({}/{})\n".format(VAF, mut_count, (mut_count + wt_count))
+    s += " Plurality VAF: {:.2f}% ({}/{})\n".format(plural_VAF, plural_mut_count, (plural_mut_count + plural_wt_count))
+    s += " Plural target calls: {}\n".format(plural_target_calls)
     low, samp_mean, high = proportionConfidenceInterval(mut_count, wt_count, 0.95)
-    print("   95%    CI: {:.2f}% -- {:.2f}%".format(low * 100.0, high * 100.0))
+    s += "   95%    CI: {:.2f}% -- {:.2f}%\n".format(low * 100.0, high * 100.0)
     low, samp_mean, high = proportionConfidenceInterval(mut_count, wt_count, 0.99)
-    print("   99%    CI: {:.2f}% -- {:.2f}%".format(low * 100.0, high * 100.0))
+    s += "   99%    CI: {:.2f}% -- {:.2f}%\n".format(low * 100.0, high * 100.0)
     low, samp_mean, high = proportionConfidenceInterval(mut_count, wt_count, 0.999)
-    print("   99.9%  CI: {:.2f}% -- {:.2f}%".format(low * 100.0, high * 100.0))
+    s += "   99.9%  CI: {:.2f}% -- {:.2f}%\n".format(low * 100.0, high * 100.0)
     low, samp_mean, high = proportionConfidenceInterval(mut_count, wt_count, 0.9999)
-    print("   99.99% CI: {:.2f}% -- {:.2f}%".format(low * 100.0, high * 100.0))
+    s += "   99.99% CI: {:.2f}% -- {:.2f}%\n".format(low * 100.0, high * 100.0)
 
     
-    print("   Read # when variant call statistically significant vs. {}% error: ".format(err * 100.0), statistical_significance_map)
+    s += "   Read # when variant call statistically significant vs. {}% error: {}\n".format(err * 100.0, statistical_significance_map)
 
 
-    print(" LAMP Concatemer Histogram:")
+    s += " LAMP Concatemer Histogram:\n"
     longest_concatemer = max(num_targets_map.keys())
     for i in range(longest_concatemer + 1):
         if i in num_targets_map.keys():
-            print("   {} : {}".format(i, num_targets_map[i]))
+            s += "   {} : {}\n".format(i, num_targets_map[i])
         else:
-            print("   {} : {}".format(i, 0))
+            s += "   {} : {}\n".format(i, 0)
 
-    print(" Average Aligned Read Accuracy:")
+    s += " Average Aligned Read Accuracy:\n"
     if total_calls > 0:
-        print("    {}/{} {}%".format(total_correct_calls, total_calls, float(total_correct_calls)/float(total_calls)*100.0))
+        s += "    {}/{} {}%\n".format(total_correct_calls, total_calls, float(total_correct_calls)/float(total_calls)*100.0)
     else:
-        print("    {}/{} {}%".format(total_correct_calls, total_calls, 'NA'))
+        s += "    {}/{} {}%\n".format(total_correct_calls, total_calls, 'NA')
 
-    print(" Error call distribution:")
-    print("    {}".format(all_bad_calls))
-    print(" Polished error call distribution:")
-    print("    {}".format(all_polished_bad_calls))
-    
+    s += " Error call distribution:\n"
+    s += "    {}\n".format(all_bad_calls)
+    s += " Polished error call distribution:\n"
+    s += "    {}\n".format(all_polished_bad_calls)
+
+    if args.print_summary_stats:
+        print("\n" + s)
+
+    # save summary stats
+    with open("{}/summary_stats.txt".format(args.output_dir), "w") as sum_stat_fh:
+        sum_stat_fh.write(s)
+
+
+    # save read classifications, basecalls, and time stamps
+    if args.save_read_classifications:
+        read_classification_list = list()
+        first = True
+        first_timestamp = results[0].timestamp
+        for result in results:
+
+            seconds_elapsed = timestampDelta(first_timestamp, result.timestamp)
+            read_classification_list.append((result.read_id, result.classification, result.plural_base, seconds_elapsed))
+
+
+        #print(read_classification_list)
+        class_fn = "{}/lamprey_read_classifications.csv".format(args.output_dir)
+
+        with open(class_fn, 'w') as filehandle:
+            filehandle.writelines("{},{},{},{}\n".format(read_id,classification,plural_base,seconds_elapsed) for read_id,classification,plural_base,seconds_elapsed in read_classification_list)
+        
     # Write output files
     # polished lamplicons
     fasta_fn = "{}/polished.fasta".format(args.output_dir)

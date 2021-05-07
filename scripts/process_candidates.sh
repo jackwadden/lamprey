@@ -24,10 +24,17 @@ minimap2 \
 KEY=${SAM_FN%_all.sam}
 
 # filter, sort, and generate a pileup of the subs; piping for efficiency
-samtools view -Sb -h -F 0x900 ${SAM_FN} | \
-samtools sort | \
+~/scripts/sam_to_bam.sh ${SAM_FN}
 samtools mpileup \
          -Q 0 \
          -f ${REF} \
-	 - \
+	 ${KEY}_all.bam \
          > ${KEY}.pileup
+
+#samtools view -Sb -h -F 0x900 ${SAM_FN} | \
+#samtools sort | \
+#samtools mpileup \
+#         -Q 0 \
+#         -f ${REF} \
+#	 - \
+#         > ${KEY}.pileup
