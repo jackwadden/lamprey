@@ -1,4 +1,4 @@
-#!/usr/bin/python
+#
 import sys, os, subprocess, argparse, collections
 import random
 import heapq
@@ -9,8 +9,8 @@ from progressbar import progressbar
 import random as rng
 
 # use local swalign?
-#sys.path.insert(0, '/home/dna/software/cswalign')
-import swalign
+sys.path.insert(0, './lib')
+import swalign 
 
 import mappy
 import pysam
