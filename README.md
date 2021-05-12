@@ -1,6 +1,6 @@
-# lamprey
+# LAMPrey
 
-A LAMP concatemer (lamplicon) analysis, variant calling, and polishing tool. LAMPrey follows a seed, chain, align paradigm to improve recovery of relevent information from lamplicons and aid in assay debugging.
+LAMPrey is a Loop-Mediated Isothermap Amplification (LAMP) concatemer analysis, variant calling, and polishing tool. LAMPrey follows a seed, chain, align paradigm to improve recovery of relevent information from lamplicons and aid in assay debugging.
 
 ## Installation
 First, install `samtools-1.10`, `bcftools`, and `minimap2`.
@@ -13,6 +13,14 @@ $ python3.7 -m venv venv3 --prompt lamprey
 $ source venv3/bin/activate
 (lamprey) $ pip install --upgrade pip
 (lamprey) $ pip install -r requirements.txt
+```
+
+LAMPrey currently relies heavily on the ```swalign``` library. This library is a pure python implementation of the Smith-Waterman local alignment algorithm and so is.... not fast. LAMPrey hugely benefits from a few loop optimizations and cython compilation of this package. An upgraded version of ```swalign``` is located at [jackwadden/swalign](https://www.github.com/jackwadden/swalign). To compile and install the accelerated version of swalign, clone the repo, run the build script, and move the resulting .so file to LAMPrey's lib/ directory.
+```
+$ git clone https://github.com/jackwadden/swalign.git
+$ cd swalign
+$ python setup.py build_ext --inplace
+$ cp swalign.cpython#####.so lamprey/lib
 ```
 
 ## Quick Start
