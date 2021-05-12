@@ -29,7 +29,7 @@ LAMPrey currently relies heavily on the ```swalign``` library. This library is a
 An example run script is provided to help users get started and play with various options. To work, LAMPrey needs the human reference (ideally pre-indexed using minimap2). The example scripts use the HG19 assembly, which can be [downloaded here](https://hgdownload.soe.ucsc.edu/goldenPath/hg19/bigZips/hg19.fa.gz).
 
 ```
-$ scripts/run_h3.3.sh <hg19_ref>.fa.idx <fastq>
+$ scripts/run_h3.3.sh <hg19_ref>.fa.idx data/H33/LAMP_14min_50.fastq
 ```
 ## General LAMPrey Usage
 
