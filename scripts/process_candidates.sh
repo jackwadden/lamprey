@@ -24,7 +24,9 @@ minimap2 \
 KEY=${SAM_FN%_all.sam}
 
 # filter, sort, and generate a pileup of the subs; piping for efficiency
-~/scripts/sam_to_bam.sh ${SAM_FN}
+full_path=$(realpath $0)
+dir_path=$(dirname $full_path)
+${dir_path}/sam_to_bam.sh ${SAM_FN}
 samtools mpileup \
          -Q 0 \
          -f ${REF} \
