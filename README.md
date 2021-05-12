@@ -28,7 +28,7 @@ LAMPrey currently relies heavily on the ```swalign``` library. This library is a
 
 An example run script is provided to help users get started and play with various options.
 ```
-$ data/H33/run_h3.3.sh <reference_minimap_idx> <fastq>
+$ scripts/run_h3.3.sh <reference_minimap_idx> <fastq>
 ```
 ## General LAMPrey Usage
 
