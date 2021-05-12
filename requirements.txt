@@ -5,3 +5,4 @@ biopython == 1.77
 vcfpy
 statsmodels
 cython
+progressbar
