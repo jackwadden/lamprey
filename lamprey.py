@@ -9,7 +9,7 @@ from progressbar import progressbar
 import random as rng
 
 # use local swalign?
-sys.path.insert(0, '/home/dna/software/cswalign')
+#sys.path.insert(0, '/home/dna/software/cswalign')
 import swalign
 
 import mappy
@@ -289,8 +289,8 @@ def findAllPrimerAlignments(aligner, seq, primers, identity_threshold, args):
 
     # bail if we didn't find a target in this read
     # this is a lazy shortcut optimization
-    #if len(alignment_list) == 0:
-    #    return(sorted(alignment_list))
+    if len(alignment_list) == 0:
+        return(sorted(alignment_list), 0.0)
 
     if args.high_confidence and len(alignment_list) < 2:
         return(sorted(alignment_list), 0.0)
