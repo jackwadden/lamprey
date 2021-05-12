@@ -30,6 +30,8 @@ An example run script is provided to help users get started and play with variou
 $ data/H33/run_h3.3.sh <reference_minimap_idx> <fastq>
 ```
 ## General LAMPrey Usage
+
+### Reference/VCF Files
 LAMPrey uses alignment to a local gene target as well as alignment to the human reference to diagnose LAMP assay performance. Therefore, you will need to supply four files (on top of a FASTQ input and LAMP schema file) for LAMPrey to run:
 1. A target reference (target_ref_fn). this is a small FASTA sequence representing the gene or genomic region the LAMP assay targets.
 2. A VCF file outlining the mutation according to the target reference (--target_vcf_fn).
@@ -38,7 +40,7 @@ LAMPrey uses alignment to a local gene target as well as alignment to the human 
 
 1/2 are technically not required and will be removed in the future in favor of an automatic extraction of the genomic region based on the ref_vcf mutation.
 
-## Example LAMP Schema File
+### LAMP Schema File
 LAMP schema files outline the ordering of expected LAMP sequences and also the sequences themselves. Sequences can be listed as forward or reverse complemented. Reverse complemented sequence names should end in a lower-case 'c'. The target sequence (```T```) is a >15bp region that contains the target information of interest to the assay. In our example, this target sequence covers the H3F3A p.K27M mutation.
 
 The expected ordering of LAMP sequences should be put into both ```fwd_primer_order``` and ```rev_primer_order``` entries. Each entry lists the LAMP sequences as expected from a properly formed concatemer and the location of the target sequence (which usually exists between the F2/B2 sequences).
