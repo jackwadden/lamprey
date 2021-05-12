@@ -17,10 +17,11 @@ $ source venv3/bin/activate
 
 LAMPrey currently relies heavily on the ```swalign``` library. This library is a pure python implementation of the Smith-Waterman local alignment algorithm and so is.... not fast. LAMPrey hugely benefits from a few loop optimizations and cython compilation of this package. An upgraded version of ```swalign``` is located at [jackwadden/swalign](https://www.github.com/jackwadden/swalign). To compile and install the accelerated version of swalign, clone the repo, run the build script, and move the resulting .so file to LAMPrey's lib/ directory.
 ```
-$ git clone https://github.com/jackwadden/swalign.git
-$ cd swalign
-$ python3 setup.py build_ext --inplace
-$ cp swalign.cpython#####.so lamprey/lib
+(lamprey) $ git clone https://github.com/jackwadden/swalign.git
+(lamprey) $ cd swalign
+(lamprey) $ python3 setup.py build_ext --inplace
+(lamprey) $ mkdir path-to-lamprey/lib
+(lamprey) $ cp swalign.cpython#####.so path-to-lamprey/lib
 ```
 
 ## Quick Start
