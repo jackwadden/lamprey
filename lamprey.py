@@ -11,6 +11,8 @@ import random as rng
 # use local swalign?
 sys.path.insert(0, './lib')
 import swalign 
+from skbio.alignment import StripedSmithWaterman
+
 
 import mappy
 import pysam
@@ -184,6 +186,36 @@ def alignPrimer(aligner, seq, primer, primer_name):
     return alignment
 
 #######
+def alignPrimer2(aligner, seq, primer, primer_name):
+    '''
+    Aligns a primer to a DNA sequence.
+    '''
+
+    #query = StripedSmithWaterman(primer, match_score = 2, mismatch_score = -1)
+    #query = StripedSmithWaterman(primer, gap_open_penalty = 1, gap_extend_penalty = 1)
+    query = StripedSmithWaterman(primer)
+    alignment = query(str(seq))
+
+    # comput matches between aligned query/target
+    matches = 0
+
+    #print(len(alignment.aligned_query_sequence), len(alignment.aligned_target_sequence))
+    #assert(len(alignment.aligned_query_sequence) == len(alignment.aligned_target_sequence))
+    
+    for i in range(0, len(alignment.aligned_query_sequence)):
+        if alignment.aligned_query_sequence[i] == alignment.aligned_target_sequence[i] :
+            matches = matches + 1
+
+    identity = float(matches)/float(len(primer))
+
+    ret_alignment = Alignment(alignment.target_begin,
+                              alignment.target_end_optimal + 1,
+                              identity,
+                              primer_name)
+
+    return ret_alignment
+
+#######
 def findPrimerAlignments(aligner, seq, primer, primer_name, identity_threshold):
     ''' 
     Greedy approach which finds the best primer alignment for a long sequence, 
@@ -192,7 +224,11 @@ def findPrimerAlignments(aligner, seq, primer, primer_name, identity_threshold):
     '''
 
     # find optimal alignment
-    alignment = alignPrimer(aligner, seq, primer, primer_name)
+    #print("*")
+    #alignment = alignPrimer(aligner, seq, primer, primer_name)
+    #print(alignment)
+    alignment = alignPrimer2(aligner, seq, primer, primer_name)
+    #print(alignment)
     alignment_len = alignment.end - alignment.start
     
     # TODO: improve heuristic (50% threshold -> 25% match passes worst case)
@@ -1306,7 +1342,9 @@ def processLamplicon(sw, process_candidates_path, generate_consensus_path, minim
 def initAligners(args):
     match = 2
     mismatch = -1
+    
     scoring = swalign.NucleotideScoringMatrix(match, mismatch)
+
     sw = swalign.LocalAlignment(scoring)  # you can also choose gap penalties, etc...
 
     # set up a mappy instance to align reads
