@@ -142,6 +142,7 @@ class Result:
         self.mut_count = mut_count
         self.wt_count = wt_count
         self.plural_base = ''
+        self.plural_base_support = 0
         self.pileup_str = pileup_str
         self.target_depth = target_depth
         self.target_seq_accuracy = (0,0)
@@ -328,7 +329,7 @@ def findAllPrimerAlignments(aligner, seq, primers, identity_threshold, args):
     if len(alignment_list) == 0:
         return(sorted(alignment_list), 0.0)
 
-    if args.high_confidence and len(alignment_list) < 2:
+    if args.high_confidence and len(alignment_list) < 3:
         return(sorted(alignment_list), 0.0)
     
     for primer_name, primer_seq in primers.primer_dict.items():
@@ -1119,7 +1120,7 @@ def processLamplicon(sw, process_candidates_path, generate_consensus_path, minim
             num_ont_seqs = num_ont_seqs + 1
 
     # if high confidence mode, only proceed if there are 2+ targets
-    if args.high_confidence and result.target_depth < 2:
+    if args.high_confidence and result.target_depth < 3:
         return Result(target_depth=0, classification='unknown', mut_count=0, wt_count=0, pileup_str='')
 
                 
@@ -1236,6 +1237,7 @@ def processLamplicon(sw, process_candidates_path, generate_consensus_path, minim
             #
 
             result.plural_base = plural_base
+            result.plural_base_support = plural_base_support
             result.mut_count = mut
             result.wt_count = wt
             result.pileup_str = code_string
@@ -1531,7 +1533,11 @@ def main(args):
                 wt_count = wt_count + 1
 
         if result.plural_base.lower() in plural_target_calls.keys():
-            plural_target_calls[result.plural_base.lower()] = plural_target_calls[result.plural_base.lower()] + 1
+            if args.high_confidence:
+                if result.plural_base_support > 2:
+                    plural_target_calls[result.plural_base.lower()] = plural_target_calls[result.plural_base.lower()] + 1
+            else:
+                plural_target_calls[result.plural_base.lower()] = plural_target_calls[result.plural_base.lower()] + 1
                         
         total_correct_calls = total_correct_calls + result.target_seq_accuracy[0]
         total_calls = total_calls + result.target_seq_accuracy[1]
