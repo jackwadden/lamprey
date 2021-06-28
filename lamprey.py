@@ -1,5 +1,6 @@
 #
 import sys, os, subprocess, argparse, collections
+import cProfile
 import random
 import heapq
 import time
@@ -172,7 +173,7 @@ def printHeader():
     print(s)
     
 #######
-def alignPrimer(aligner, seq, primer, primer_name):
+def alignPrimer_swalign(aligner, seq, primer, primer_name):
     '''
     Aligns a primer to a DNA sequence.
     '''
@@ -186,22 +187,16 @@ def alignPrimer(aligner, seq, primer, primer_name):
     return alignment
 
 #######
-def alignPrimer2(aligner, seq, primer, primer_name):
+def alignPrimer_skbio(aligner, seq, primer, primer_name):
     '''
     Aligns a primer to a DNA sequence.
     '''
 
-    #query = StripedSmithWaterman(primer, match_score = 2, mismatch_score = -1)
-    #query = StripedSmithWaterman(primer, gap_open_penalty = 1, gap_extend_penalty = 1)
     query = StripedSmithWaterman(primer)
     alignment = query(str(seq))
 
-    # comput matches between aligned query/target
+    # compute matches between aligned query/target
     matches = 0
-
-    #print(len(alignment.aligned_query_sequence), len(alignment.aligned_target_sequence))
-    #assert(len(alignment.aligned_query_sequence) == len(alignment.aligned_target_sequence))
-    
     for i in range(0, len(alignment.aligned_query_sequence)):
         if alignment.aligned_query_sequence[i] == alignment.aligned_target_sequence[i] :
             matches = matches + 1
@@ -216,7 +211,7 @@ def alignPrimer2(aligner, seq, primer, primer_name):
     return ret_alignment
 
 #######
-def findPrimerAlignments(aligner, seq, primer, primer_name, identity_threshold):
+def findPrimerAlignments(aligner, seq, primer, primer_name, identity_threshold, args):
     ''' 
     Greedy approach which finds the best primer alignment for a long sequence, 
     then uses left/right recursion to find all other possible (non-overlapping) 
@@ -225,9 +220,12 @@ def findPrimerAlignments(aligner, seq, primer, primer_name, identity_threshold):
 
     # find optimal alignment
     #print("*")
-    #alignment = alignPrimer(aligner, seq, primer, primer_name)
+    #
     #print(alignment)
-    alignment = alignPrimer2(aligner, seq, primer, primer_name)
+    if args.swalign:
+        alignment = alignPrimer_swalign(aligner, seq, primer, primer_name)
+    else:
+        alignment = alignPrimer_skbio(aligner, seq, primer, primer_name)
     #print(alignment)
     alignment_len = alignment.end - alignment.start
     
@@ -246,13 +244,13 @@ def findPrimerAlignments(aligner, seq, primer, primer_name, identity_threshold):
         # recurse left
         if len(left_seq) >= len(primer):
             left_alignments = findPrimerAlignments(
-                    aligner, left_seq, primer, primer_name, identity_threshold) 
+                aligner, left_seq, primer, primer_name, identity_threshold, args) 
             alignment_list.extend(left_alignments)
         
         # recurse right
         if len(right_seq) >= len(primer):
             right_alignments = findPrimerAlignments(
-                    aligner, right_seq, primer, primer_name, identity_threshold)
+                    aligner, right_seq, primer, primer_name, identity_threshold, args)
 
             # adjust right alignment positioning (since we cropped out seq start)
             for right_alignment in right_alignments:
@@ -320,8 +318,8 @@ def findAllPrimerAlignments(aligner, seq, primers, identity_threshold, args):
 
     alignment_list = list()
 
-    alignment_list.extend(findPrimerAlignments(aligner, seq, primers.primer_dict["T"], "T", identity_threshold))
-    alignment_list.extend(findPrimerAlignments(aligner, seq, rc(primers.primer_dict["T"]), "Tc", identity_threshold))
+    alignment_list.extend(findPrimerAlignments(aligner, seq, primers.primer_dict["T"], "T", identity_threshold, args))
+    alignment_list.extend(findPrimerAlignments(aligner, seq, rc(primers.primer_dict["T"]), "Tc", identity_threshold, args))
 
     # bail if we didn't find a target in this read
     # this is a lazy shortcut optimization
@@ -336,9 +334,9 @@ def findAllPrimerAlignments(aligner, seq, primers, identity_threshold, args):
             continue
         else:
             # fwd
-            alignment_list.extend(findPrimerAlignments(aligner, seq, primer_seq, primer_name, identity_threshold))
+            alignment_list.extend(findPrimerAlignments(aligner, seq, primer_seq, primer_name, identity_threshold, args))
             # rc
-            alignment_list.extend(findPrimerAlignments(aligner, seq, rc(primer_seq), primer_name + "c", identity_threshold))
+            alignment_list.extend(findPrimerAlignments(aligner, seq, rc(primer_seq), primer_name + "c", identity_threshold, args))
 
 
     alignment_list = sorted(alignment_list)
@@ -1119,7 +1117,7 @@ def processLamplicon(sw, process_candidates_path, generate_consensus_path, minim
             num_ont_seqs = num_ont_seqs + 1
 
     # if high confidence mode, only proceed if there are 2+ targets
-    if args.high_confidence and result.target_depth < 2:
+    if args.high_confidence and result.target_depth < 3:
         return Result(target_depth=0, classification='unknown', mut_count=0, wt_count=0, pileup_str='')
 
                 
@@ -1701,6 +1699,7 @@ def argparser():
             help="Primer identity threshold for successful alignment")
     parser.add_argument("--time_sort", action="store_true", default=False)
     parser.add_argument("--high_confidence", action="store_true", default=False)
+    parser.add_argument("--swalign", action="store_true", default=False)
     
     # run options
     parser.add_argument("--num_threads", type=int, default=1)
