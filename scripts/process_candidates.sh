@@ -5,21 +5,21 @@ SAM_FN=${2}
 REF=${3}
 
 # align each extracted concatemer piece
-#minimap2 \
-#    -a \
-#    -xmap-ont \
-#    --eqx \
-#    -t 1 \
-#    -w 1 \
-#    -n 1 \
-#    -N 5 \
-#    --secondary=no \
-#    -m 0 \
-#3    -p 0.6 \
-#    -s 30 \
-#    -o ${SAM_FN} \
-#    ${REF} \
-#    ${FASTA}
+minimap2 \
+    -a \
+    -xmap-ont \
+    --eqx \
+    -t 1 \
+    -w 1 \
+    -n 1 \
+    -N 5 \
+    --secondary=no \
+    -m 0 \
+3    -p 0.6 \
+    -s 30 \
+    -o ${SAM_FN} \
+    ${REF} \
+    ${FASTA}
 
 KEY=${SAM_FN%_all.sam}
 
