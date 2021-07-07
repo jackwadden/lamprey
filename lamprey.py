@@ -1168,6 +1168,7 @@ def processLamplicon(sw, process_candidates_path, generate_consensus_path, minim
         # extend each target into a single amplicon and emit as fasta
         target_idx = 0
         targets = []
+        oriented_targets = []
         alignment_intervals = list()
         alignment_interval_dict = dict()
         for alignment in alignments:
@@ -1199,6 +1200,7 @@ def processLamplicon(sw, process_candidates_path, generate_consensus_path, minim
                 )
 
                 targets.append(record)
+                oriented_targets.append((record, direction))
                 target_idx += 1
 
         # Print intervals
@@ -1207,7 +1209,7 @@ def processLamplicon(sw, process_candidates_path, generate_consensus_path, minim
             for interval in alignment_intervals:
                 print(interval)
             print("", flush=True)
-          
+
         # write separated targets to new FASTA file
         fasta_fn = "{}/{}.fasta".format(args.output_dir, lamp_idx)
         with open(fasta_fn, "w") as output_handle:
@@ -1230,10 +1232,16 @@ def processLamplicon(sw, process_candidates_path, generate_consensus_path, minim
             target_ref_str = data[1]
             
         # align the reads using skbio alignment
+        # BUG this doesn't align revcomp
+        # really should just rip this out for bwamem
         target_alignments = list()
-        for target in targets:
-            # get string
-            query = StripedSmithWaterman(str(target.seq))
+        for target, direction in oriented_targets:
+
+            # get string and align appropriate fwd version
+            if direction == 'rev':
+                query = StripedSmithWaterman(rc(str(target.seq)))
+            else:
+                query = StripedSmithWaterman(str(target.seq))
             target_alignment = query(target_ref_str)
 
             cigar_tuples = cigarStringToTuples(target_alignment.cigar)
@@ -1243,7 +1251,6 @@ def processLamplicon(sw, process_candidates_path, generate_consensus_path, minim
                     count -= value
                 else:
                     count += value
-            
            
             aligned_query_string = target_alignment.aligned_query_sequence.replace('-','')
 
