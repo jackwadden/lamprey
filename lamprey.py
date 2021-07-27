@@ -118,7 +118,10 @@ class PrimerSet:
                     self.primer_dict[primer_name[:-1]] = rc(primer_string)
                 else:
                     self.primer_dict[primer_name] = primer_string
-                        
+
+
+            print(self.fwd_primer_order)
+            print(self.rev_primer_order)
 #########################
 class Alignment:
     '''
@@ -404,6 +407,10 @@ def setPrimerColor(primer_string):
         color = '\u001b[38;5;4;7m'
     elif primer_string == 'F2c':
         color = '\u001b[38;5;4m'
+    elif primer_string == 'F3':
+        color = '\u001b[38;5;4;7m'
+    elif primer_string == 'F3c':
+        color = '\u001b[38;5;4m'
     elif primer_string == 'F1':
         color = '\u001b[38;5;75;7m'
     elif primer_string == 'F1c':
@@ -411,6 +418,10 @@ def setPrimerColor(primer_string):
     elif primer_string == 'B2':
         color = '\u001b[38;5;1;7m'
     elif primer_string == 'B2c':
+        color = '\u001b[38;5;1m'
+    elif primer_string == 'B3':
+        color = '\u001b[38;5;1;7m'
+    elif primer_string == 'B3c':
         color = '\u001b[38;5;1m'
     elif primer_string == 'B1':
         color = '\u001b[38;5;204;7m'
@@ -635,6 +646,10 @@ def extractAmpliconAroundTarget(primer_set, alignments, target):
                 break
         else:
             primer_counter = primer_counter - 1
+
+            # if primer counter goes below zero, break
+            if primer_counter < 0:
+                break
 
     if all_matched:
         amplicon_start = 0
