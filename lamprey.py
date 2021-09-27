@@ -362,10 +362,8 @@ def findAllPrimerAlignments(aligner, seq, primers, identity_threshold, args):
 
     # bail if we didn't find a target in this read
     # this is a lazy shortcut optimization
-    if len(alignment_list) == 0:
-        return(sorted(alignment_list), 0.0)
-
-    if args.high_confidence and len(alignment_list) < 3:
+    # high confidence mode raises the bar for the number of targets considered
+    if len(alignment_list) < args.confidence_level:
         return(sorted(alignment_list), 0.0)
     
     for primer_name, primer_seq in primers.primer_dict.items():
@@ -1167,15 +1165,15 @@ def processLamplicon(sw, process_candidates_path, generate_consensus_path, minim
         if alignment.primer_name.startswith('ont') and alignment.identity >= args.threshold:
             num_ont_seqs = num_ont_seqs + 1
 
-    # if high confidence mode, only proceed if there are 2+ targets
-    if args.high_confidence and result.target_depth < 3:
-        return Result(target_depth=0, classification='unknown', mut_count=0, wt_count=0, pileup_str='')
+    # Only proceed if there are more targets than the confidence level (default is 1)
+    #if result.target_depth < args.confidence_level:
+    #    return Result(target_depth=0, classification='unknown', mut_count=0, wt_count=0, pileup_str='')
 
                 
     ####################################
     # if we found a suspected target seed
     # attempt to extend seed, and align to target region
-    if result.target_depth > 0:
+    if result.target_depth >= args.confidence_level:
 
         ###############################################################################
         #  STAGE 1: extend target seed to left/right to identify candidate sub-reads  #
@@ -1247,8 +1245,6 @@ def processLamplicon(sw, process_candidates_path, generate_consensus_path, minim
             target_ref_str = data[1]
             
         # align the reads using skbio alignment
-        # BUG this doesn't align revcomp
-        # really should just rip this out for bwamem
         target_alignments = list()
         for target, direction in oriented_targets:
 
@@ -1257,6 +1253,7 @@ def processLamplicon(sw, process_candidates_path, generate_consensus_path, minim
                 query = StripedSmithWaterman(rc(str(target.seq)))
             else:
                 query = StripedSmithWaterman(str(target.seq))
+
             target_alignment = query(target_ref_str)
 
             cigar_tuples = cigarStringToTuples(target_alignment.cigar)
@@ -1266,7 +1263,8 @@ def processLamplicon(sw, process_candidates_path, generate_consensus_path, minim
                     count -= value
                 else:
                     count += value
-           
+
+            # remove deletion placeholders
             aligned_query_string = target_alignment.aligned_query_sequence.replace('-','')
 
             # generate samfile from alignments
@@ -1339,15 +1337,15 @@ def processLamplicon(sw, process_candidates_path, generate_consensus_path, minim
             print("  - Pileup result: ",ref, result.target_depth, code_string, covers_roi)
 
             
-        # in high confidence mode, ignore pileups that have less than 2 entries
-        if args.high_confidence and result.target_depth < 2:
-            #0, 'unknown', 0, 0
-            # TODO fix result assignment to zero here
-            return result 
 
         # a sub-read that successfully aligns to and covers the target locus is confirmed as a target sequence
         if result.target_depth > 0:
-            result.classification = 'target'
+
+            # label reads with aligned targets, but below the confidence level
+            if result.target_depth < args.confidence_level:
+                result.classification = 'low_confidence'
+            else:
+                result.classification = 'target'
         
             # parse code string and set mut/wt counts
             wt, mut = parsePileupCodeString(code_string, variant)
@@ -1659,7 +1657,7 @@ def main(args):
                 wt_count = wt_count + 1
 
         if result.plural_base.lower() in plural_target_calls.keys():
-            if args.high_confidence:
+            if args.confidence_level:
                 if result.plural_base_support > 2:
                     plural_target_calls[result.plural_base.lower()] = plural_target_calls[result.plural_base.lower()] + 1
             else:
@@ -1832,7 +1830,7 @@ def argparser():
     parser.add_argument("--threshold", type=float, default=0.75,
             help="Primer identity threshold for successful alignment")
     parser.add_argument("--time_sort", action="store_true", default=False)
-    parser.add_argument("--high_confidence", action="store_true", default=False)
+    parser.add_argument("--confidence_level", type=int, default=1)
     parser.add_argument("--swalign", action="store_true", default=False)
     
     # run options
