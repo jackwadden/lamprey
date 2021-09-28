@@ -3,9 +3,11 @@ import sys, os, subprocess, argparse, collections
 import cProfile
 import random
 import heapq
+from collections import Counter
 import time
 import multiprocessing
 from progressbar import progressbar
+
 
 import random as rng
 
@@ -23,10 +25,15 @@ import numpy as np
 import statsmodels.api as sm
 import datetime
 
+
 from Bio import SeqIO
 from Bio.SeqRecord import SeqRecord
 from Bio.Seq import Seq
 from Bio.Sequencing.Applications import SamtoolsViewCommandline
+
+
+from watchdog.observers import Observer
+from watchdog.events import PatternMatchingEventHandler
 
 #########################
 cigarOpMap = {'M' : 0,
@@ -40,6 +47,11 @@ cigarOpMap = {'M' : 0,
               'X' : 8,
               'B' : 9}
 
+#########################
+class Calls:
+    
+    def __init__(self, calls = dict({'a' : 0, 't' : 0, 'c' : 0, 'g' : 0, '*' : 0, 'ref' : 0})):
+        self.calls = calls
 #########################
 class bcolors:
     HEADER = '\033[95m'
@@ -155,7 +167,7 @@ class Result:
     Stores lamplicon classification, pileup info, and other post processing information.
     '''
 
-    def __init__(self, classification='unknown', mut_count=0, wt_count=0, pileup_str='', target_depth=0, alignments=[], seq=None, idx=0, read_id = '', timestamp=None):
+    def __init__(self, classification='unknown', calls = Calls(), mut_count=0, wt_count=0, pileup_str='', target_depth=0, alignments=[], seq=None, idx=0, read_id = '', timestamp=None):
         self.classification = classification
         self.mut_count = mut_count
         self.wt_count = wt_count
@@ -176,6 +188,194 @@ class Result:
     def __lt__(self, other):
         return self.timestamp < other.timestamp
 
+
+#########################
+class Results:
+    '''
+    Stores classification, pileup info, and other post processing information for a set of reads.
+    '''
+
+    def __init__(self, ref_vcf_record, target_vcf_record):
+        self.calls = dict({'a' : 0, 't' : 0, 'c' : 0, 'g' : 0, '*' : 0, 'ref' : 0})
+        self.ref_base = target_vcf_record.REF.lower()
+        for alt in target_vcf_record.ALT:
+            self.mut_base = alt.value.lower()
+        self.results = []
+        self.conf_interval = None
+        self.milestone_map = {0.95 : False, 0.99 : False, 0.999 : False, 0.9999 : False}
+        
+    def append(self, result):
+        self.results.append(result)
+
+        # add the result of the base call to the calls data structure
+        if result.classification == 'target':
+            self.calls[result.plural_base] += 1
+
+            # compute stats in realtime
+            mut = self.calls[self.mut_base]
+            ref = self.calls[self.ref_base]
+            total = mut + ref
+
+            for conf_level in [0.95, 0.99, 0.999, 0.9999]:
+                err = 0.015
+                self.conf_interval = proportionConfidenceInterval(mut, ref, conf_level)
+                vaf = self.conf_interval[1]
+                observed_low = self.conf_interval[0]
+                err_bound = proportionConfidenceErrorBound(mut, ref, conf_level)
+                err_low, err_mean, err_high = proportionConfidenceInterval(err * float(total), (1.0 - err) * float(total), conf_level)
+                
+                # are we statistically significant?
+                if mut > 10 and observed_low > err_high and not self.milestone_map[conf_level]:
+                    print("Target VAF ({:2f}% {}/{}) statistically significant at {} CL at time {}".format(vaf, mut, total, conf_level, datetime.datetime.now()))
+                    self.milestone_map[conf_level] = True
+            
+    def __len__(self):
+        return len(self.results)
+            
+    def __str__(self):
+        mut_count = self.calls[self.mut_base]
+        ref_count = self.calls[self.ref_base]
+        total_count = mut_count + ref_count
+
+        s = "VAF: {:.2f}% (mut/wt {}/{}) Time: {}\n".format(getVAF(self.calls, self.ref_base, self.mut_base), mut_count, total_count, datetime.datetime.now())
+
+        if self.conf_interval is not None:
+            err_bound = proportionConfidenceErrorBound(self.calls[self.mut_base], self.calls[self.ref_base], 0.95)
+            s += "  95% CI: +/- {:.4f}%\n".format(err_bound)
+            err_bound = proportionConfidenceErrorBound(self.calls[self.mut_base], self.calls[self.ref_base], 0.99)
+            s += "  99% CI: +/- {:.4f}%\n".format(err_bound)
+            err_bound = proportionConfidenceErrorBound(self.calls[self.mut_base], self.calls[self.ref_base], 0.999)
+            s += "  99.9% CI: +/- {:.4f}%\n".format(err_bound)
+            err_bound = proportionConfidenceErrorBound(self.calls[self.mut_base], self.calls[self.ref_base], 0.9999)
+            s += "  99.99% CI: +/- {:.4f}%\n".format(err_bound)
+        else:
+            s += "  95% CI: +/- NA%\n"
+            s += "  99% CI: +/- NA%\n"
+            s += "  99.9% CI: +/- NA%\n"
+            s += "  99.99% CI: +/- NA%\n"
+
+        return s
+    
+##########################
+class Watcher:
+
+    def __init__(self, args):
+        self.observer = Observer()
+        self.args = args
+        #
+        self.fastq_dir = args.watchdog
+        
+        # initialize minimap2
+        print("> Initializing aligners")
+        self.sw, self.minimap2 = initAligners(args)
+        
+        # read in LAMP files
+        # parse primers from config file
+        print("> Parsing LAMP assay schema file: {}".format(args.primer_set_fn))
+        self.primers = PrimerSet(args.primer_set_fn)
+        
+        print("> Parsing target mutation VCF files:")
+        # parse ref VCF file if there is one
+        if args.ref_vcf_fn != '':
+            print("  * {}".format(args.ref_vcf_fn))
+            self.ref_vcf_record = parseVCF(args.ref_vcf_fn)
+            
+        # parse VCF file if there is one
+        if args.target_vcf_fn != '':
+            print("  * {}".format(args.target_vcf_fn))
+            self.target_vcf_record = parseVCF(args.target_vcf_fn)
+
+    def run(self):
+        event_handler = FastqHandler(self.primers, self.ref_vcf_record, self.target_vcf_record, self.sw, self.minimap2, args)
+        self.observer.schedule(event_handler, self.fastq_dir, recursive=True)
+
+        self.observer.start()
+        try:
+            while True:
+                time.sleep(1)
+        except KeyboardInterrupt:
+            self.observer.stop()
+        self.observer.join()
+
+
+####        
+class FastqHandler(PatternMatchingEventHandler):
+
+    def __init__(self, primers, ref_vcf_record, target_vcf_record, sw, minimap2, args, file_count=0, id_counter=0):
+        PatternMatchingEventHandler.__init__(self, patterns=['*.fastq'], ignore_directories=True, case_sensitive=True)
+        self.primers = primers
+        self.ref_vcf_record = ref_vcf_record
+        self.target_vcf_record = target_vcf_record
+        self.args = args
+        self.minimap2 = minimap2
+        self.sw = sw
+        self.file_count = file_count
+        self.id_counter = id_counter
+        self.results = Results(self.ref_vcf_record, self.target_vcf_record)
+        
+    def on_created(self, event):
+        print("FASTQ created: {}".format(event.src_path))
+        self.file_count += 1
+
+        # if not included, file creation will trigger event handler before the file is finished being written
+        time.sleep(0.1)
+        
+        # parse lamplicons
+        raw_lamplicons = SeqIO.parse(event.src_path, "fastq")
+
+        handle = open(event.src_path)
+        lines = handle.readlines()
+        print("FILE LENGTH: ", len(lines))
+        handle.close()
+        
+        # process each one
+        # give each lamplicon an id
+        lamplicons = []
+        for lamplicon in raw_lamplicons:
+            lamplicons.append((self.id_counter, lamplicon))
+            self.id_counter += 1
+            #print(self.id_counter, lamplicon.seq)
+        print("  * found {} reads.".format(len(lamplicons)), self.id_counter)
+
+        # process the batch
+        # get file directory for relative script paths
+        dirname = os.path.dirname(__file__)
+        process_candidates_path = os.path.join(dirname, 'scripts/process_candidates.sh')
+        generate_consensus_path = os.path.join(dirname, 'scripts/generate_consensus.sh')
+        os.makedirs(args.output_dir, exist_ok=True)
+
+        for lamp_idx,lamplicon in lamplicons:
+        
+            #print_green("Processing Lamplicon {} \r".format(lamp_idx + 1))
+
+            if args.time_sort:
+                timestamp = parseTimestamp(lamplicon.description.split()[5].split('=')[1])
+            else:
+                timestamp = 0
+            
+            result = processLamplicon(self.sw,
+                                      process_candidates_path,
+                                      generate_consensus_path,
+                                      self.minimap2,
+                                      lamp_idx,
+                                      lamplicon,
+                                      self.primers,
+                                      self.ref_vcf_record,
+                                      self.target_vcf_record,
+                                      self.args);
+            
+            # add to list of results
+            result.read_id = lamplicon.name
+            result.idx = lamp_idx
+            result.timestamp = timestamp
+            #self.results.append(result)
+
+            #
+            self.results = processResultsOnline(self.results, result)
+        
+    def print_file_count(self):
+        print(self.file_count)
+        
 ##########################
 def printHeader():
     s = ''
@@ -211,6 +411,16 @@ def cigarStringToTuples(cigar):
 
     return tuples
 
+#######
+def getVAF(calls, ref, mut):
+
+    VAF = 0.0                                              
+    if calls[mut] + calls[ref] > 0:
+        VAF = float(calls[mut])/float(calls[mut] + calls[ref]) * 100.0
+
+    return VAF
+
+                                                  
 #######
 def alignSequence_swalign(aligner, seq, primer, primer_name):
     '''
@@ -347,7 +557,7 @@ def pruneRapidAdapters(aligner, seq):
         alignment.dump()
 
     # check rc ybot
-    alignment = sw.align(adapter_ybot, rc(read_string))
+    alignment = aligner.align(adapter_ybot, rc(read_string))
     if alignment.q_pos > len(read_string) - (len(adapter_ybot) * 2) and alignment.identity > 0.55:
         print("Found possible adapter bot on rc:")
         alignment.dump()
@@ -363,8 +573,8 @@ def findAllPrimerAlignments(aligner, seq, primers, identity_threshold, args):
     # bail if we didn't find a target in this read
     # this is a lazy shortcut optimization
     # high confidence mode raises the bar for the number of targets considered
-    if len(alignment_list) < args.confidence_level:
-        return(sorted(alignment_list), 0.0)
+    #if len(alignment_list) < args.confidence_level:
+    #    return(sorted(alignment_list), 0.0)
     
     for primer_name, primer_seq in primers.primer_dict.items():
         if primer_name == 'T':
@@ -838,6 +1048,37 @@ def getPluralityVoter(calls):
     return majority_base, max_count
 
 ################################################
+def getMajorityVoter(calls):
+
+    total_calls = sum(calls.values())
+
+    # is there a plurality voter?
+    plural_bases = set()
+    majority_base = ''
+    majority_vote = False
+    max_count = 0
+    for base, count in calls.items():
+
+        if count > max_count:
+            max_count = count
+            majority_base = base
+            majority_vote = True
+                                                                
+        if count == max_count:
+            plurality_vote = False
+
+    for base, count in calls.items():
+        if count == max_count:
+            plural_bases.add(base)
+                                
+    # if there was a plurality vote, pick that
+    # else choose, random call among the tied plurality
+    if majority_vote == False and plurality_vote == False:
+        majority_base = random.choice(plural_bases)
+
+    return majority_base, max_count
+
+################################################
 def extractPileupInfo(pileup_fn, contig, target_locus, limit):
     # parse lines in the pileup, extract the depth at the locus
 
@@ -925,6 +1166,14 @@ def proportionConfidenceInterval(mut, wt, conf):
     #print("conf:", conf, "%.4f" % (conf_int[0]*100.0), " -- ", "%.2f" % samp_mean, " -- ", "%.4f" % (conf_int[1]*100.0), ")")
 
     return conf_int[0], samp_mean, conf_int[1]
+
+################################################
+def proportionConfidenceErrorBound(mut, wt, conf):
+
+    low, vaf, high = proportionConfidenceInterval(mut, wt, conf)
+    err_bound = vaf - low * 100.0
+
+    return err_bound
 
 def isStatisticallySignificant(mut, wt, conf, err):
 
@@ -1131,7 +1380,7 @@ def polishLamplicon(lamplicon, subread_alignment_file, alignment_interval_dict):
     return polished_lamplicon
 
 ################################################
-def processLamplicon(sw, process_candidates_path, generate_consensus_path, minimap2, bwamem, lamp_idx, lamplicon, primers, ref_vcf_record, target_vcf_record, args):
+def processLamplicon(sw, process_candidates_path, generate_consensus_path, minimap2, lamp_idx, lamplicon, primers, ref_vcf_record, target_vcf_record, args):
 
     if args.debug_print:
         print_green("Processing Lamplicon {}".format(lamp_idx))
@@ -1173,7 +1422,7 @@ def processLamplicon(sw, process_candidates_path, generate_consensus_path, minim
     ####################################
     # if we found a suspected target seed
     # attempt to extend seed, and align to target region
-    if result.target_depth >= args.confidence_level:
+    if result.target_depth > 0:
 
         ###############################################################################
         #  STAGE 1: extend target seed to left/right to identify candidate sub-reads  #
@@ -1351,8 +1600,8 @@ def processLamplicon(sw, process_candidates_path, generate_consensus_path, minim
             wt, mut = parsePileupCodeString(code_string, variant)
             calls = countCallsFromPileup(ref, code_string)
             plural_base, plural_base_support = getPluralityVoter(calls)
-            #
 
+            #
             result.plural_base = plural_base
             result.plural_base_support = plural_base_support
             result.mut_count = mut
@@ -1470,13 +1719,7 @@ def initAligners(args):
     minimap2 = mappy.Aligner(args.human_ref_fn)  # load or build index
     if not minimap2: raise Exception("ERROR: failed to load/build index")
 
-    # set up bwamem
-    #index = "/data/human_reference/H3F3A.fa"
-    #options = "-k {}".format(15)
-    #bwamem = bwapy.BwaAligner(index, options)
-
-    
-    return sw, minimap2, None
+    return sw, minimap2
 
 
 #####
@@ -1491,7 +1734,7 @@ def processLamplicons(args, primers, ref_vcf_record, target_vcf_record, lamplico
     # initialize aligner
     if args.debug_print:
         print("> initializing aligners")
-    sw, minimap2, bwamem = initAligners(args)
+    sw, minimap2 = initAligners(args)
 
     results = []
     
@@ -1508,7 +1751,6 @@ def processLamplicons(args, primers, ref_vcf_record, target_vcf_record, lamplico
                                   process_candidates_path,
                                   generate_consensus_path,
                                   minimap2,
-                                  bwamem,
                                   lamp_idx,
                                   lamplicon,
                                   primers,
@@ -1523,20 +1765,214 @@ def processLamplicons(args, primers, ref_vcf_record, target_vcf_record, lamplico
         results.append(result)
 
         q.put(result)
+
+
+#####
+def processResultsOnline(results, new_result):
+
+    results.append(new_result)
+
+    if len(results) == 1:
+        sys.stdout.write("\n")
+    sys.stdout.write("{}".format(str(results))+ "\033[F" * 5)
+    sys.stdout.flush()
+    time.sleep(0.05)
+    
+    return results
+
         
+#####
+def processResultsOffline(results, target_vcf_record):
+
+    classification_counters = dict({'target' : 0, 'low_confidence' : 0, 'fragment' : 0, 'background' : 0, 'ont' : 0, 'spurious' : 0, 'short' : 0, 'unknown' : 0})
+    target_counter = 0
+    mut_count = 0
+    wt_count = 0
+    other_count = 0
+    
+    statistical_significance_map = dict()
+    num_targets_map = dict()
+    all_bad_calls = dict({'a' : 0, 't' : 0, 'c' : 0, 'g' : 0, '*' : 0, 'ref' : 0})
+    all_polished_bad_calls = dict({'a' : 0, 't' : 0, 'c' : 0, 'g' : 0, '*' : 0, 'ref' : 0})
+    plural_target_calls = dict({'a' : 0, 't' : 0, 'c' : 0, 'g' : 0, '*' : 0, 'ref' : 0})
+    plural_mut_count = 0
+    plural_wt_calls = 0
+    
+    polished_lamplicons = list()
+    
+    total_correct_calls = 0
+    total_calls = 0
+    
+    time_ordered_index = 0
+    for result in results:
+
+        classification_counters[result.classification] = classification_counters[result.classification] + 1
+        
+        if result.classification == 'target':
+            target_counter = target_counter + 1
+
+            # build histogram of target count
+            if result.target_depth not in num_targets_map.keys():
+                num_targets_map[result.target_depth] = 1
+            else:
+                num_targets_map[result.target_depth] = num_targets_map[result.target_depth] + 1
             
+            if result.plural_base.lower() in plural_target_calls.keys():
+                plural_target_calls[result.plural_base.lower()] = plural_target_calls[result.plural_base.lower()] + 1
+                        
+        total_correct_calls = total_correct_calls + result.target_seq_accuracy[0]
+        total_calls = total_calls + result.target_seq_accuracy[1]
+
+        # collect all bad calls to identify basecall error trends
+        if result.bad_calls is not None:
+            for key in all_bad_calls:
+                if key in result.bad_calls:
+                    all_bad_calls[key] = all_bad_calls[key] + result.bad_calls[key]
+
+        # collect all bad calls to identify basecall error trends
+        if result.polished_bad_calls is not None:
+            for key in all_polished_bad_calls:
+                if key in result.polished_bad_calls:
+                    all_polished_bad_calls[key] = all_polished_bad_calls[key] + result.polished_bad_calls[key]
+
+
+        # collect polished lamplicons to emit
+        if result.polished_seq is not None:
+            polished_lamplicons.append(result.polished_seq)
+        else:
+            polished_lamplicons.append(result.seq)
+
+        # Compute VAF based on plural calls
+        mut_base = ''
+        for alt in target_vcf_record.ALT:
+            mut_base = alt.value.lower()
+        wt_base = target_vcf_record.REF.lower()
+        mut_count = plural_target_calls[mut_base]
+        wt_count = plural_target_calls[wt_base]
+        other_count = sum(plural_target_calls.values()) - mut_count - wt_count
+
+        VAF = getVAF(plural_target_calls, wt_base, mut_base)
+
+        # Compute various confidence intervals and various confidence levels
+        #  also note if VAF is statistically significant relative to static backround error (bg_err)
+        bg_err = 0.015
+        if mut_count + wt_count > 0:
+            
+            # confidence intervals
+    
+            conf = 0.95
+        
+            if isStatisticallySignificant(mut_count, wt_count, conf, bg_err) and (conf not in statistical_significance_map.keys()):
+                statistical_significance_map[conf] = time_ordered_index + 1
+
+            conf = 0.99
+            if isStatisticallySignificant(mut_count, wt_count, conf, bg_err) and (conf not in statistical_significance_map.keys()):
+                statistical_significance_map[conf] = time_ordered_index + 1
+
+            conf = 0.999
+            if isStatisticallySignificant(mut_count, wt_count, conf, bg_err) and (conf not in statistical_significance_map.keys()):
+                statistical_significance_map[conf] = time_ordered_index + 1
+
+            conf = 0.9999
+            if isStatisticallySignificant(mut_count, wt_count, conf, bg_err) and (conf not in statistical_significance_map.keys()):
+                statistical_significance_map[conf] = time_ordered_index + 1
+
+        time_ordered_index = time_ordered_index + 1
+
+        
+    # Summary results
+    low, samp_mean, high = proportionConfidenceInterval(mut_count, wt_count, 0.95)
+        
+    # print results
+    s = ""
+    s += "|---------------------|\n"
+    s += "|   Summary Results   |\n"
+    s += "|---------------------|\n"
+    s += " Target Fraction: {:.2f}%\n".format(float(target_counter)/float(len(results)) * 100.0)
+    s += " Classifications: "
+    s += str(classification_counters) + "\n"
+    
+    #plural_mut_count = plural_target_calls[
+        
+    s += " Plurality VAF: {:.2f}% ({}/{} other calls:{})\n".format(VAF, mut_count, (mut_count + wt_count), other_count)
+    s += " Plural target calls: {}\n".format(plural_target_calls)
+    low, samp_mean, high = proportionConfidenceInterval(mut_count, wt_count, 0.95)
+    s += "   95%    CI: {:.2f}% -- {:.2f}%\n".format(low * 100.0, high * 100.0)
+    low, samp_mean, high = proportionConfidenceInterval(mut_count, wt_count, 0.99)
+    s += "   99%    CI: {:.2f}% -- {:.2f}%\n".format(low * 100.0, high * 100.0)
+    low, samp_mean, high = proportionConfidenceInterval(mut_count, wt_count, 0.999)
+    s += "   99.9%  CI: {:.2f}% -- {:.2f}%\n".format(low * 100.0, high * 100.0)
+    low, samp_mean, high = proportionConfidenceInterval(mut_count, wt_count, 0.9999)
+    s += "   99.99% CI: {:.2f}% -- {:.2f}%\n".format(low * 100.0, high * 100.0)
+
+    
+    s += "   Read # when variant call statistically significant vs. {}% backround error: {}\n".format(bg_err * 100.0, statistical_significance_map)
+
+
+    s += " LAMP Concatemer Histogram:\n"
+    longest_concatemer = max(num_targets_map.keys())
+    for i in range(longest_concatemer + 1):
+        if i in num_targets_map.keys():
+            s += "   {} : {}\n".format(i, num_targets_map[i])
+        else:
+            s += "   {} : {}\n".format(i, 0)
+
+    s += " Average Aligned Read Accuracy:\n"
+    if total_calls > 0:
+        s += "    {}/{} {}%\n".format(total_correct_calls, total_calls, float(total_correct_calls)/float(total_calls)*100.0)
+    else:
+        s += "    {}/{} {}%\n".format(total_correct_calls, total_calls, 'NA')
+
+    s += " Error call distribution:\n"
+    s += "    {}\n".format(all_bad_calls)
+    s += " Polished error call distribution:\n"
+    s += "    {}\n".format(all_polished_bad_calls)
+
+    if args.print_summary_stats:
+        print("\n" + s)
+
+
+    # save summary stats
+    with open("{}/summary_stats.txt".format(args.output_dir), "w") as sum_stat_fh:
+        sum_stat_fh.write(s)
+
+
+    # save read classifications, basecalls, and time stamps
+    if args.save_read_classifications:
+        read_classification_list = list()
+        first = True
+        first_timestamp = results[0].timestamp
+        for result in results:
+
+            seconds_elapsed = timestampDelta(first_timestamp, result.timestamp)
+            read_classification_list.append((result.read_id, result.classification, result.plural_base, seconds_elapsed))
+
+
+        #print(read_classification_list)
+        class_fn = "{}/lamprey_read_classifications.csv".format(args.output_dir)
+
+        with open(class_fn, 'w') as filehandle:
+            filehandle.writelines("{},{},{},{}\n".format(read_id,classification,plural_base,seconds_elapsed) for read_id,classification,plural_base,seconds_elapsed in read_classification_list)
+        
+    # Write output files
+    # polished lamplicons
+    fasta_fn = "{}/polished.fasta".format(args.output_dir)
+    #TODO: Nonetypes gett added to the polished list sometimes....
+    if len(polished_lamplicons) > 0:
+        with open(fasta_fn, "w") as output_handle:
+            SeqIO.write(polished_lamplicons, output_handle, "fasta")
+
+        
 #####
 def runProcess(thread_id, q, args, primers, rev_vcf_record, target_vcf_record, lamplicon_batch):
 
     processLamplicons(args, primers, rev_vcf_record, target_vcf_record, lamplicon_batch, q)
 
 
-def main(args):
+#####
+def runOfflineMode(args):
 
-    # print header
-    printHeader()
-    
-    # load and parse files
+        # load and parse files
     # parse all lamplicons from FASTQ file
     print("> Parsing lamplicon file: {}".format(args.lamplicons_fn))
     #lamplicon_seqs = [l.seq for l in SeqIO.parse(args.lamplicons_fn, "fastq")]
@@ -1615,203 +2051,58 @@ def main(args):
     if args.time_sort:
         results.sort()
     
-    classification_counters = dict({'target' : 0, 'fragment' : 0, 'background' : 0, 'ont' : 0, 'spurious' : 0, 'short' : 0, 'unknown' : 0})
-    target_counter = 0
-    mut_count = 0
-    wt_count = 0
+    processResultsOffline(results, target_vcf_record)
 
-    statistical_significance_map = dict()
-    num_targets_map = dict()
-    all_bad_calls = dict({'a' : 0, 't' : 0, 'c' : 0, 'g' : 0, '*' : 0, 'ref' : 0})
-    all_polished_bad_calls = dict({'a' : 0, 't' : 0, 'c' : 0, 'g' : 0, '*' : 0, 'ref' : 0})
-    plural_target_calls = dict({'a' : 0, 't' : 0, 'c' : 0, 'g' : 0, '*' : 0, 'ref' : 0})
-    plural_mut_count = 0
-    plural_wt_calls = 0
-    
-    polished_lamplicons = list()
-    
-    total_correct_calls = 0
-    total_calls = 0
-    
-    time_ordered_index = 0
-    for result in results:
 
-        classification_counters[result.classification] = classification_counters[result.classification] + 1
+###################################################
+def on_created(event):
+    print("FASTQ created: {}".format(event.src_path))
+
+    # process fastq
+    raw_lamplicons = SeqIO.parse(args.lamplicons_fn, "fastq")
+
+    # give each lamplicon an id
+    lamplicons = []
+    id_counter = 0
+    for lamplicon in raw_lamplicons:
+        lamplicons.append((id_counter, lamplicon))
+        id_counter = id_counter + 1
+
+    print("  * found {} reads.".format(len(lamplicons)))
+
+    return 7
+
+def runOnlineMode(args):
+
+    fastq_dir = args.watchdog
+    
+    print("Running in online mode...")
+    print("Monitoring for FASTQs at: {}".format(fastq_dir))
+
+    # check if directory exists
+    isdir = os.path.isdir(fastq_dir)
+    if not isdir:
+        print("Directory {} does not exist.".format(fastq_dir))
+        exit(1)
+
+    
+    watcher = Watcher(args)
+    watcher.run()
+    
+    #####################
+                    
+####################################################    
+def main(args):
+
+    # print header
+    printHeader()
+
+    if args.watchdog is not '':
+        runOnlineMode(args)
         
-        if result.classification == 'target':
-            target_counter = target_counter + 1
-
-        # build histogram of target count
-        if result.target_depth not in num_targets_map.keys():
-            num_targets_map[result.target_depth] = 1
-        else:
-            num_targets_map[result.target_depth] = num_targets_map[result.target_depth] + 1
-
-            
-        # mut/wt counting. majority vote among sections.
-        if result.target_depth > 0:
-            if float(result.mut_count)/float(result.target_depth) > 0.5:
-                mut_count = mut_count + 1
-
-            if float(result.wt_count)/float(result.target_depth) > 0.5:
-                wt_count = wt_count + 1
-
-        if result.plural_base.lower() in plural_target_calls.keys():
-            if args.confidence_level:
-                if result.plural_base_support > 2:
-                    plural_target_calls[result.plural_base.lower()] = plural_target_calls[result.plural_base.lower()] + 1
-            else:
-                plural_target_calls[result.plural_base.lower()] = plural_target_calls[result.plural_base.lower()] + 1
-                        
-        total_correct_calls = total_correct_calls + result.target_seq_accuracy[0]
-        total_calls = total_calls + result.target_seq_accuracy[1]
-
-        # collect all bad calls to identify basecall error trends
-        if result.bad_calls is not None:
-            for key in all_bad_calls:
-                if key in result.bad_calls:
-                    all_bad_calls[key] = all_bad_calls[key] + result.bad_calls[key]
-
-        # collect all bad calls to identify basecall error trends
-        if result.polished_bad_calls is not None:
-            for key in all_polished_bad_calls:
-                if key in result.polished_bad_calls:
-                    all_polished_bad_calls[key] = all_polished_bad_calls[key] + result.polished_bad_calls[key]
-
-
-        # collect polished lamplicons to emit
-        if result.polished_seq is not None:
-            polished_lamplicons.append(result.polished_seq)
-        else:
-            polished_lamplicons.append(result.seq)
-        #
-        err = 0.015
-        if mut_count + wt_count > 0:
-            
-            # confidence intervals
-    
-            conf = 0.95
-        
-            if isStatisticallySignificant(mut_count, wt_count, conf, err) and (conf not in statistical_significance_map.keys()):
-                statistical_significance_map[conf] = time_ordered_index + 1
-
-            conf = 0.99
-            if isStatisticallySignificant(mut_count, wt_count, conf, err) and (conf not in statistical_significance_map.keys()):
-                statistical_significance_map[conf] = time_ordered_index + 1
-
-            conf = 0.999
-            if isStatisticallySignificant(mut_count, wt_count, conf, err) and (conf not in statistical_significance_map.keys()):
-                statistical_significance_map[conf] = time_ordered_index + 1
-
-            conf = 0.9999
-            if isStatisticallySignificant(mut_count, wt_count, conf, err) and (conf not in statistical_significance_map.keys()):
-                statistical_significance_map[conf] = time_ordered_index + 1
-
-        time_ordered_index = time_ordered_index + 1
-
-        
-    # Summary results
-    low, samp_mean, high = proportionConfidenceInterval(mut_count, wt_count, 0.95)
-        
-    # print results
-    s = ""
-    s += "|---------------------|\n"
-    s += "|   Summary Results   |\n"
-    s += "|---------------------|\n"
-    s += " Target Fraction: {:.2f}%\n".format(float(target_counter)/float(len(lamplicons)) * 100.0)
-    s += " Classifications: "
-    s += str(classification_counters) + "\n"
-
-    # VAF calculations
-    mut_base = ''
-    for alt in target_vcf_record.ALT:
-        mut_base = alt.value.lower()
-    wt_base = target_vcf_record.REF.lower()
-
-    
-    if mut_count + wt_count > 0:
-        VAF = float(mut_count)/float(mut_count + wt_count) * 100.0
     else:
-        VAF = 0.0
-
-    plural_mut_count = plural_target_calls[mut_base]
-    plural_wt_count = plural_target_calls[wt_base]
-
-    if plural_mut_count + plural_wt_count > 0:
-        plural_VAF = float(plural_mut_count)/float(plural_mut_count + plural_wt_count) * 100.0
-    else:
-        plural_VAF = 0.0
-
-    #plural_mut_count = plural_target_calls[
-        
-    s += " Majority VAF: {:.2f}% ({}/{})\n".format(VAF, mut_count, (mut_count + wt_count))
-    s += " Plurality VAF: {:.2f}% ({}/{})\n".format(plural_VAF, plural_mut_count, (plural_mut_count + plural_wt_count))
-    s += " Plural target calls: {}\n".format(plural_target_calls)
-    low, samp_mean, high = proportionConfidenceInterval(mut_count, wt_count, 0.95)
-    s += "   95%    CI: {:.2f}% -- {:.2f}%\n".format(low * 100.0, high * 100.0)
-    low, samp_mean, high = proportionConfidenceInterval(mut_count, wt_count, 0.99)
-    s += "   99%    CI: {:.2f}% -- {:.2f}%\n".format(low * 100.0, high * 100.0)
-    low, samp_mean, high = proportionConfidenceInterval(mut_count, wt_count, 0.999)
-    s += "   99.9%  CI: {:.2f}% -- {:.2f}%\n".format(low * 100.0, high * 100.0)
-    low, samp_mean, high = proportionConfidenceInterval(mut_count, wt_count, 0.9999)
-    s += "   99.99% CI: {:.2f}% -- {:.2f}%\n".format(low * 100.0, high * 100.0)
-
-    
-    s += "   Read # when variant call statistically significant vs. {}% error: {}\n".format(err * 100.0, statistical_significance_map)
-
-
-    s += " LAMP Concatemer Histogram:\n"
-    longest_concatemer = max(num_targets_map.keys())
-    for i in range(longest_concatemer + 1):
-        if i in num_targets_map.keys():
-            s += "   {} : {}\n".format(i, num_targets_map[i])
-        else:
-            s += "   {} : {}\n".format(i, 0)
-
-    s += " Average Aligned Read Accuracy:\n"
-    if total_calls > 0:
-        s += "    {}/{} {}%\n".format(total_correct_calls, total_calls, float(total_correct_calls)/float(total_calls)*100.0)
-    else:
-        s += "    {}/{} {}%\n".format(total_correct_calls, total_calls, 'NA')
-
-    s += " Error call distribution:\n"
-    s += "    {}\n".format(all_bad_calls)
-    s += " Polished error call distribution:\n"
-    s += "    {}\n".format(all_polished_bad_calls)
-
-    if args.print_summary_stats:
-        print("\n" + s)
-
-    # save summary stats
-    with open("{}/summary_stats.txt".format(args.output_dir), "w") as sum_stat_fh:
-        sum_stat_fh.write(s)
-
-
-    # save read classifications, basecalls, and time stamps
-    if args.save_read_classifications:
-        read_classification_list = list()
-        first = True
-        first_timestamp = results[0].timestamp
-        for result in results:
-
-            seconds_elapsed = timestampDelta(first_timestamp, result.timestamp)
-            read_classification_list.append((result.read_id, result.classification, result.plural_base, seconds_elapsed))
-
-
-        #print(read_classification_list)
-        class_fn = "{}/lamprey_read_classifications.csv".format(args.output_dir)
-
-        with open(class_fn, 'w') as filehandle:
-            filehandle.writelines("{},{},{},{}\n".format(read_id,classification,plural_base,seconds_elapsed) for read_id,classification,plural_base,seconds_elapsed in read_classification_list)
-        
-    # Write output files
-    # polished lamplicons
-    fasta_fn = "{}/polished.fasta".format(args.output_dir)
-    #TODO: Nonetypes gett added to the polished list sometimes....
-    if len(polished_lamplicons) > 0:
-        with open(fasta_fn, "w") as output_handle:
-            SeqIO.write(polished_lamplicons, output_handle, "fasta")
-
+        # run in offline mode
+        runOfflineMode(args)
 
     
 def argparser():
@@ -1835,6 +2126,7 @@ def argparser():
     
     # run options
     parser.add_argument("--num_threads", type=int, default=1)
+    parser.add_argument("--watchdog", type=str, default='')
     
     # print options
     parser.add_argument("--debug_print", action="store_true", default=False)
