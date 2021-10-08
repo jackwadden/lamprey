@@ -1,5 +1,6 @@
 #
 import sys, os, subprocess, argparse, collections
+import shutil
 import cProfile
 import random
 import heapq
@@ -7,7 +8,6 @@ from collections import Counter
 import time
 import multiprocessing
 from progressbar import progressbar
-
 
 import random as rng
 
@@ -255,15 +255,38 @@ class Results:
             s += "  99.99% CI: +/- NA%\n"
 
         return s
-    
+
 ##########################
-class Watcher:
+class Fast5Watcher:
 
     def __init__(self, args):
         self.observer = Observer()
         self.args = args
         #
-        self.fastq_dir = args.watchdog
+        self.source_fast5_dir = args.watchdog
+
+    def run(self):
+
+        source_fast5_dir = args.watchdog
+        fast5_event_handler = Fast5Handler(source_fast5_dir)
+        self.observer.schedule(fast5_event_handler, source_fast5_dir, recursive=True)
+
+        self.observer.start()
+        try:
+            while True:
+                time.sleep(1)
+        except KeyboardInterrupt:
+            self.observer.stop()
+        self.observer.join()
+    
+##########################
+class FastqWatcher:
+
+    def __init__(self, args):
+        self.observer = Observer()
+        self.args = args
+        #
+        self.source_fast5_dir = args.watchdog
         
         # initialize minimap2
         print("> Initializing aligners")
@@ -286,8 +309,10 @@ class Watcher:
             self.target_vcf_record = parseVCF(args.target_vcf_fn)
 
     def run(self):
-        event_handler = FastqHandler(self.primers, self.ref_vcf_record, self.target_vcf_record, self.sw, self.minimap2, args)
-        self.observer.schedule(event_handler, self.fastq_dir, recursive=True)
+
+        fastq_event_handler = FastqHandler(self.primers, self.ref_vcf_record, self.target_vcf_record, self.sw, self.minimap2, args)
+        source_fastq_dir = os.getcwd() + "/lamprey_results/fastq"
+        self.observer.schedule(fastq_event_handler, source_fastq_dir, recursive=True)
 
         self.observer.start()
         try:
@@ -297,6 +322,36 @@ class Watcher:
             self.observer.stop()
         self.observer.join()
 
+#######################################                                                                                                    
+class Fast5Handler(PatternMatchingEventHandler):
+
+    def __init__(self, source_fast5_dir):
+        PatternMatchingEventHandler.__init__(self,patterns=['*.fast5'], ignore_directories=True, case_sensitive=True)
+        self.source_fast5_dir = source_fast5_dir
+
+    def on_created(self, event):
+        print("Fast5 created!: {}".format(event.src_path))
+
+        # copy to local dir
+        fast5_dir = os.getcwd() + "/lamprey_results/fast5"
+        fastq_dir = os.getcwd() + "/lamprey_results/fastq"
+        process_list_path = os.getcwd() + '/lamprey_results/process_list.txt'
+        filename = event.src_path.split('/')[-1] 
+        shutil.copyfile(event.src_path, fast5_dir + "/" + filename)
+        
+        # make a processing list
+        f = open(process_list_path, 'w')
+        f.write(filename)
+        f.close()
+
+        # basecall
+        dirname = os.path.dirname(__file__)
+        basecall_script_path = os.path.join(dirname, 'scripts/basecall_barcoded_fast5.sh')
+        basecall_script_path = os.path.join(dirname, 'scripts/basecall_barcoded_fast5.sh')
+        
+        subprocess.run([basecall_script_path, fast5_dir, fastq_dir, process_list_path])
+
+    
 
 ####        
 class FastqHandler(PatternMatchingEventHandler):
@@ -312,20 +367,29 @@ class FastqHandler(PatternMatchingEventHandler):
         self.file_count = file_count
         self.id_counter = id_counter
         self.results = Results(self.ref_vcf_record, self.target_vcf_record)
-        
+
+    # check to see if a file was created as a fastq in this directory
     def on_created(self, event):
-        print("FASTQ created: {}".format(event.src_path))
+        self.process_file(event.src_path)
+
+    # check to see if a file was renamed or moved to target directory as a fastq
+    def on_moved(self, event):
+        self.process_file(event.dest_path)
+
+    def process_file(self, event_path):
+    
+        #print("FASTQ created: {}".format(event.src_path))
         self.file_count += 1
 
         # if not included, file creation will trigger event handler before the file is finished being written
         time.sleep(0.1)
         
         # parse lamplicons
-        raw_lamplicons = SeqIO.parse(event.src_path, "fastq")
+        raw_lamplicons = SeqIO.parse(event_path, "fastq")
 
-        handle = open(event.src_path)
+        handle = open(event_path)
         lines = handle.readlines()
-        print("FILE LENGTH: ", len(lines))
+        #print("FILE LENGTH: ", len(lines))
         handle.close()
         
         # process each one
@@ -335,7 +399,7 @@ class FastqHandler(PatternMatchingEventHandler):
             lamplicons.append((self.id_counter, lamplicon))
             self.id_counter += 1
             #print(self.id_counter, lamplicon.seq)
-        print("  * found {} reads.".format(len(lamplicons)), self.id_counter)
+        #print("  * found {} reads.".format(len(lamplicons)), self.id_counter)
 
         # process the batch
         # get file directory for relative script paths
@@ -1043,7 +1107,13 @@ def getPluralityVoter(calls):
     # if there was a plurality vote, pick that
     # else choose, random call among the tied plurality
     if majority_vote == False and plurality_vote == False:
+
+        ## pick random choice?
         majority_base = random.choice(plural_bases)
+
+        ## throw out the vote?
+        #majority_base = 'n'
+        #max_count = 0
 
     return majority_base, max_count
 
@@ -1436,15 +1506,15 @@ def processLamplicon(sw, process_candidates_path, generate_consensus_path, minim
         for alignment in alignments:
 
             if alignment.primer_name == 'T' or alignment.primer_name == 'Tc':
-        
+
                 # extend sequence around target for better mapping
                 seq_start, seq_end = extractAmpliconAroundTarget(primers, alignments, alignment)
-        
+                
                 # if we get a -1 for seq end, we never matched to the right, 
                 # so just grab the whole read
                 if seq_end == -1:
                     seq_end = len(lamplicon.seq) - 1
-
+                    
                 subread_id = "{}_{}".format(lamp_idx, target_idx)
                 if alignment.primer_name == 'T':
                     direction = 'fwd'
@@ -1464,7 +1534,9 @@ def processLamplicon(sw, process_candidates_path, generate_consensus_path, minim
                 targets.append(record)
                 oriented_targets.append((record, direction))
                 target_idx += 1
+                #
 
+                
         # Print intervals
         if args.debug_print:
             print("* Found {} candidate sub-reads at intervals:".format(len(alignment_intervals)))
@@ -1601,6 +1673,14 @@ def processLamplicon(sw, process_candidates_path, generate_consensus_path, minim
             calls = countCallsFromPileup(ref, code_string)
             plural_base, plural_base_support = getPluralityVoter(calls)
 
+            # even if we have a plural call, make sure there are enough bases to reach the confidence level
+            # can maybe adjust this to include fwd/reverse bias.....
+            if plural_base_support < args.confidence_level:
+                if(args.debug_print):
+                    print("Plural basecall did not meet confidence level.... classifying as 'low_confidence'")
+                result.classification = 'low_confidence'
+
+            
             #
             result.plural_base = plural_base
             result.plural_base_support = plural_base_support
@@ -1613,7 +1693,7 @@ def processLamplicon(sw, process_candidates_path, generate_consensus_path, minim
                 print("  - Found {} mut and {} wt calls".format(result.mut_count, result.wt_count))
                 print("  - Plural basecall: {}".format(result.plural_base))
 
-
+                
     #######################################
     # if we never found an alignable target sequence
     # attempt to diagnose the issue and classify the read as something other than target
@@ -1764,6 +1844,10 @@ def processLamplicons(args, primers, ref_vcf_record, target_vcf_record, lamplico
         result.timestamp = timestamp
         results.append(result)
 
+        # add base reporting output here
+        #
+        #
+        
         q.put(result)
 
 
@@ -1807,7 +1891,7 @@ def processResultsOffline(results, target_vcf_record):
     for result in results:
 
         classification_counters[result.classification] = classification_counters[result.classification] + 1
-        
+
         if result.classification == 'target':
             target_counter = target_counter + 1
 
@@ -1910,13 +1994,17 @@ def processResultsOffline(results, target_vcf_record):
 
 
     s += " LAMP Concatemer Histogram:\n"
-    longest_concatemer = max(num_targets_map.keys())
-    for i in range(longest_concatemer + 1):
-        if i in num_targets_map.keys():
-            s += "   {} : {}\n".format(i, num_targets_map[i])
-        else:
-            s += "   {} : {}\n".format(i, 0)
 
+    if len(num_targets_map.keys()) > 0:
+        longest_concatemer = max(num_targets_map.keys())
+        for i in range(longest_concatemer + 1):
+            if i in num_targets_map.keys():
+                s += "   {} : {}\n".format(i, num_targets_map[i])
+            else:
+                s += "   {} : {}\n".format(i, 0)
+    else:
+        s += "   {} : {}\n".format(0, 0)
+                
     s += " Average Aligned Read Accuracy:\n"
     if total_calls > 0:
         s += "    {}/{} {}%\n".format(total_correct_calls, total_calls, float(total_correct_calls)/float(total_calls)*100.0)
@@ -2055,39 +2143,44 @@ def runOfflineMode(args):
 
 
 ###################################################
-def on_created(event):
-    print("FASTQ created: {}".format(event.src_path))
-
-    # process fastq
-    raw_lamplicons = SeqIO.parse(args.lamplicons_fn, "fastq")
-
-    # give each lamplicon an id
-    lamplicons = []
-    id_counter = 0
-    for lamplicon in raw_lamplicons:
-        lamplicons.append((id_counter, lamplicon))
-        id_counter = id_counter + 1
-
-    print("  * found {} reads.".format(len(lamplicons)))
-
-    return 7
+def basecallerProcess(args):
+    fast5_watcher = Fast5Watcher(args)
+    fast5_watcher.run()
 
 def runOnlineMode(args):
 
-    fastq_dir = args.watchdog
+    source_fast5_dir = args.watchdog
     
     print("Running in online mode...")
-    print("Monitoring for FASTQs at: {}".format(fastq_dir))
+    print("  Dumping results to ./lamprey_results")
+    print("  Monitoring for FAST5s at: {}".format(source_fast5_dir))
+    print("    and copying to: ./lamprey_results/fast5")
+    print("  Basecalling and monitoring for FASTQs at: ./lamprey_results/fastq")
 
+    # set up result directory
+    current_path = os.getcwd()
+    os.makedirs(current_path + "/lamprey_results/fast5", exist_ok=True)
+    os.makedirs(current_path + "/lamprey_results/fastq", exist_ok=True)
+          
     # check if directory exists
-    isdir = os.path.isdir(fastq_dir)
+    isdir = os.path.isdir(source_fast5_dir)
     if not isdir:
-        print("Directory {} does not exist.".format(fastq_dir))
-        exit(1)
+        print("WARNING: Source fast5 directory {} does not exist.".format(source_fast5_dir))
+        print("  - Please double check the file path.")
+        print("  - Creating empty location in antici....pation of reads...")
+        os.makedirs(source_fast5_dir, exist_ok=True)
 
-    
-    watcher = Watcher(args)
-    watcher.run()
+    # start basecalling (fast5watcher)
+    basecaller_process = multiprocessing.Process(target = basecallerProcess, args = (args,))
+    basecaller_process.start()
+
+    # start LAMPrey FASTQ monitor
+    fastq_watcher = FastqWatcher(args)
+    fastq_watcher.run()
+
+    # join basecaller if the main watcher ever dies
+    basecaller_process.join()
+
     
     #####################
                     
