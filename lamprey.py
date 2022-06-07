@@ -171,7 +171,7 @@ class Result:
         self.classification = classification
         self.mut_count = mut_count
         self.wt_count = wt_count
-        self.plural_base = ''
+        self.plural_base = 'n'
         self.plural_base_support = 0
         self.pileup_str = pileup_str
         self.target_depth = target_depth
@@ -184,10 +184,22 @@ class Result:
         self.idx = idx
         self.read_id = read_id
         self.timestamp = timestamp
-
+        
     def __lt__(self, other):
         return self.timestamp < other.timestamp
 
+    def __str__(self):
+        s = ''
+        s += str(self.idx) + ' '
+        s += self.read_id + ' '
+        s += str(self.timestamp) + ' '
+        s += self.classification + ' '
+        s += str(self.mut_count) + ' '
+        s += str(self.wt_count) + ' '
+        s += self.plural_base + ' '
+        s += str(self.plural_base_support) + ' '
+        s += str(self.target_depth) + ' '
+        return s
 
 #########################
 class Results:
@@ -197,12 +209,20 @@ class Results:
 
     def __init__(self, ref_vcf_record, target_vcf_record):
         self.calls = dict({'a' : 0, 't' : 0, 'c' : 0, 'g' : 0, '*' : 0, 'ref' : 0})
+        
         self.ref_base = target_vcf_record.REF.lower()
         for alt in target_vcf_record.ALT:
             self.mut_base = alt.value.lower()
         self.results = []
         self.conf_interval = None
-        self.milestone_map = {0.95 : False, 0.99 : False, 0.999 : False, 0.9999 : False}
+        self.milestone_map = {"0.95" : False,
+                              "0.99" : False,
+                              "0.999" : False,
+                              "0.9999" : False,
+                              "0.95+0.05" : False,
+                              "0.99+0.05" : False,
+                              "0.999+0.05" : False,
+                              "0.9999+0.05" : False}
         
     def append(self, result):
         self.results.append(result)
@@ -216,19 +236,55 @@ class Results:
             ref = self.calls[self.ref_base]
             total = mut + ref
 
+            # confidence level/interval significance vs background error
+            err = 0.015
             for conf_level in [0.95, 0.99, 0.999, 0.9999]:
-                err = 0.015
                 self.conf_interval = proportionConfidenceInterval(mut, ref, conf_level)
                 vaf = self.conf_interval[1]
                 observed_low = self.conf_interval[0]
+                observed_mean = self.conf_interval[1]
+                observed_high = self.conf_interval[2]
                 err_bound = proportionConfidenceErrorBound(mut, ref, conf_level)
                 err_low, err_mean, err_high = proportionConfidenceInterval(err * float(total), (1.0 - err) * float(total), conf_level)
+
+                s = ''
                 
                 # are we statistically significant?
-                if mut > 10 and observed_low > err_high and not self.milestone_map[conf_level]:
-                    print("Target VAF ({:2f}% {}/{}) statistically significant at {} CL at time {}".format(vaf, mut, total, conf_level, datetime.datetime.now()))
-                    self.milestone_map[conf_level] = True
-            
+                # must have at least 10 reads supporting the mutation
+                if mut > 10 and observed_low > err_high and not self.milestone_map[str(conf_level)]:
+                    s = "#Target VAF ({:2f}% {}/{}) statistically significant at {} CL at time {}".format(vaf, mut, total, conf_level, datetime.datetime.now())
+
+                    # print and log to result file
+                    print(s)
+                    result_trace_path = os.getcwd() + "/lamprey_results/results.trace" 
+                    with open(result_trace_path, 'a') as handle:
+                        handle.write(s + "\n")
+                        handle.close()
+
+                    # mark milestone as completed
+                    self.milestone_map[str(conf_level)] = True
+                    
+                # are the confidence intervals tight? (+/- 5%)
+                CI_bound = 0.05
+                CI = observed_high - observed_mean/100.0
+                milestone_key = str(conf_level) + "+" + str(CI_bound)
+                if mut > 10 and  CI < CI_bound and not self.milestone_map[milestone_key]:
+                    s = "#Target VAF ({:2f}% {}/{}) has CI within +/-{} (+/-{}) for {} CL at time {}".format(vaf, mut, total, CI_bound, CI, conf_level,  datetime.datetime.now())
+
+                    # print and log to result file
+                    print(s)
+                    result_trace_path = os.getcwd() + "/lamprey_results/results.trace" 
+                    with open(result_trace_path, 'a') as handle:
+                        handle.write(s + "\n")
+                        handle.close()
+                        
+                    # mark milestone as completed
+                    self.milestone_map[milestone_key] = True
+
+                    
+                    
+            # number of reads supporting
+                    
     def __len__(self):
         return len(self.results)
             
@@ -237,7 +293,7 @@ class Results:
         ref_count = self.calls[self.ref_base]
         total_count = mut_count + ref_count
 
-        s = "VAF: {:.2f}% (mut/wt {}/{}) Time: {}\n".format(getVAF(self.calls, self.ref_base, self.mut_base), mut_count, total_count, datetime.datetime.now())
+        s = "VAF: {:.2f}% (mut/wt {}/{}  total reads considered:{}) Time: {}\n".format(getVAF(self.calls, self.ref_base, self.mut_base), mut_count, total_count, len(self.results), datetime.datetime.now())
 
         if self.conf_interval is not None:
             err_bound = proportionConfidenceErrorBound(self.calls[self.mut_base], self.calls[self.ref_base], 0.95)
@@ -269,6 +325,7 @@ class Fast5Watcher:
 
         source_fast5_dir = args.watchdog
         fast5_event_handler = Fast5Handler(source_fast5_dir)
+
         self.observer.schedule(fast5_event_handler, source_fast5_dir, recursive=True)
 
         self.observer.start()
@@ -311,7 +368,20 @@ class FastqWatcher:
     def run(self):
 
         fastq_event_handler = FastqHandler(self.primers, self.ref_vcf_record, self.target_vcf_record, self.sw, self.minimap2, args)
-        source_fastq_dir = os.getcwd() + "/lamprey_results/fastq"
+
+        # this is the directory where we monitor for fastqs
+        if args.watchdog_barcode is not '':
+            source_fastq_dir = os.getcwd() + "/lamprey_results/fastq/" + args.watchdog_barcode
+        else:
+            source_fastq_dir = os.getcwd() + "/lamprey_results/fastq/"
+        isdir = os.path.isdir(source_fastq_dir)
+        if not isdir:
+            print("WARNING: Source FASTQ directory {} does not exist yet.".format(source_fastq_dir))
+            print("  - Please double check the file path.")
+            print("  - Creating empty location in antici....pation of reads...")
+            os.makedirs(source_fastq_dir, exist_ok=True)
+
+        #####
         self.observer.schedule(fastq_event_handler, source_fastq_dir, recursive=True)
 
         self.observer.start()
@@ -346,8 +416,10 @@ class Fast5Handler(PatternMatchingEventHandler):
 
         # basecall
         dirname = os.path.dirname(__file__)
-        basecall_script_path = os.path.join(dirname, 'scripts/basecall_barcoded_fast5.sh')
-        basecall_script_path = os.path.join(dirname, 'scripts/basecall_barcoded_fast5.sh')
+        if args.watchdog_barcode is not '':
+            basecall_script_path = os.path.join(dirname, 'scripts/basecall_barcoded_fast5.sh')
+        else:
+            basecall_script_path = os.path.join(dirname, 'scripts/basecall_fast5.sh')
         
         subprocess.run([basecall_script_path, fast5_dir, fastq_dir, process_list_path])
 
@@ -381,7 +453,7 @@ class FastqHandler(PatternMatchingEventHandler):
         #print("FASTQ created: {}".format(event.src_path))
         self.file_count += 1
 
-        # if not included, file creation will trigger event handler before the file is finished being written
+        # if not included, file creation might trigger event handler before the file is finished being written
         time.sleep(0.1)
         
         # parse lamplicons
@@ -412,11 +484,8 @@ class FastqHandler(PatternMatchingEventHandler):
         
             #print_green("Processing Lamplicon {} \r".format(lamp_idx + 1))
 
-            if args.time_sort:
-                timestamp = parseTimestamp(lamplicon.description.split()[5].split('=')[1])
-            else:
-                timestamp = 0
-            
+            timestamp = parseTimestamp(lamplicon.description.split()[5].split('=')[1])
+                        
             result = processLamplicon(self.sw,
                                       process_candidates_path,
                                       generate_consensus_path,
@@ -1859,7 +1928,15 @@ def processResultsOnline(results, new_result):
     if len(results) == 1:
         sys.stdout.write("\n")
     sys.stdout.write("{}".format(str(results))+ "\033[F" * 5)
+
+    # write result to log file
+    result_trace_path = os.getcwd() + "/lamprey_results/results.trace" 
+    with open(result_trace_path, 'a') as handle:
+        handle.write(str(new_result) + " " + str(datetime.datetime.now()) + "\n")
+    handle.close()
+
     sys.stdout.flush()
+    # necessary in case fast5s come out too fast
     time.sleep(0.05)
     
     return results
@@ -2156,12 +2233,14 @@ def runOnlineMode(args):
     print("  Monitoring for FAST5s at: {}".format(source_fast5_dir))
     print("    and copying to: ./lamprey_results/fast5")
     print("  Basecalling and monitoring for FASTQs at: ./lamprey_results/fastq")
+    print("  Saving all FASTQs to: ./lamprey_results/fastq_saved")
 
     # set up result directory
     current_path = os.getcwd()
     os.makedirs(current_path + "/lamprey_results/fast5", exist_ok=True)
     os.makedirs(current_path + "/lamprey_results/fastq", exist_ok=True)
-          
+    os.makedirs(current_path + "/lamprey_results/fastq_saved", exist_ok=True)
+        
     # check if directory exists
     isdir = os.path.isdir(source_fast5_dir)
     if not isdir:
@@ -2211,7 +2290,7 @@ def argparser():
     parser.add_argument("--ref_vcf_fn", type=str, default='')
 
     # algorithm options
-    parser.add_argument("--threshold", type=float, default=0.75,
+    parser.add_argument("--threshold", type=float, default=0.70,
             help="Primer identity threshold for successful alignment")
     parser.add_argument("--time_sort", action="store_true", default=False)
     parser.add_argument("--confidence_level", type=int, default=1)
@@ -2220,6 +2299,7 @@ def argparser():
     # run options
     parser.add_argument("--num_threads", type=int, default=1)
     parser.add_argument("--watchdog", type=str, default='')
+    parser.add_argument("--watchdog_barcode", type=str, default='')
     
     # print options
     parser.add_argument("--debug_print", action="store_true", default=False)
@@ -2230,8 +2310,6 @@ def argparser():
     parser.add_argument("--save_concatemers", action="store_true", default=False)
     parser.add_argument("--save_read_classifications", action="store_true", default=False)
 
-
-    
     
     return parser
 
