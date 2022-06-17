@@ -15,7 +15,7 @@ minimap2 \
     -N 5 \
     --secondary=no \
     -m 0 \
-    -p 0.6 \
+3    -p 0.6 \
     -s 30 \
     -o ${SAM_FN} \
     ${REF} \

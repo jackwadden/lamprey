@@ -7,3 +7,4 @@ statsmodels
 cython
 progressbar2
 scikit-bio
+watchdog

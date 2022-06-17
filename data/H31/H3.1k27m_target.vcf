@@ -6,4 +6,4 @@
 ##phasing=none
 ##INFO=<ID=DP,Number=1,Type=Integer,Description="Total Depth">
 #CHROM	POS	ID	REF	ALT	QUAL	FILTER	INFO	FORMAT
-HIST1H3B	459	.	T	A	.	.	.
+HIST1H3B	402	.	T	A	.	.	.
