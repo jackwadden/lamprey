@@ -1,9 +1,0 @@
-##fileformat=VCFv4.1
-##fileDate=20201020
-##source=handcoded
-##reference=hg19
-##contig=<ID=HIST1H3B,length=627>
-##phasing=none
-##INFO=<ID=DP,Number=1,Type=Integer,Description="Total Depth">
-#CHROM	POS	ID	REF	ALT	QUAL	FILTER	INFO	FORMAT
-chr6	26032206	.	T	A	.	.	.
